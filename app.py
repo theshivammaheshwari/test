@@ -482,13 +482,65 @@ def show_main_form():
                 qty = st.number_input(f"Qty {i+1}", min_value=1, value=it.get('quantity',1), key=f"qty_{i}")
             with c3:
                 if len(st.session_state.form_items)>1:
-                    if st.button(f"Remove {i+1}", key=f"rm_{i}"):
-                        st.session_state.form_items.pop(i); st.rerun()
-            st.session_state.form_items[i] = {'name': item_name, 'quantity': qty}
-        if st.button("+ Add Item"):
-            st.session_state.form_items.append({'name':'','quantity':1}); st.rerun()
+                            # Items section
+        st.markdown("### 📦 Items to Issue")
 
-        submitted = st.form_submit_button("Submit Form", type="primary")
+        # Initialize items in session state
+        if 'form_items' not in st.session_state:
+            st.session_state.form_items = [{'name': '', 'quantity': 1}]
+
+        # Render rows
+        remove_triggered = False
+        remove_index = None
+
+        for i, it in enumerate(st.session_state.form_items):
+            c1, c2, c3 = st.columns([2, 1, 1])
+
+            with c1:
+                item_name = st.selectbox(
+                    f"Item {i+1}",
+                    [""] + available_items + ["Other"],
+                    key=f"item_{i}"
+                )
+                if item_name == "Other":
+                    custom = st.text_input(f"Custom Item {i+1}", key=f"custom_{i}")
+                    if custom:
+                        item_name = custom
+
+            with c2:
+                qty = st.number_input(
+                    f"Qty {i+1}",
+                    min_value=1,
+                    value=int(it.get('quantity', 1) or 1),
+                    key=f"qty_{i}"
+                )
+
+            with c3:
+                # IMPORTANT: Use form_submit_button inside the form
+                if len(st.session_state.form_items) > 1:
+                    rm = st.form_submit_button("Remove", key=f"remove_{i}")
+                    if rm:
+                        remove_triggered = True
+                        remove_index = i
+
+            # Update the row in session
+            st.session_state.form_items[i] = {'name': item_name, 'quantity': qty}
+
+        # If any remove clicked, update and rerun early
+        if remove_triggered and remove_index is not None:
+            st.session_state.form_items.pop(remove_index)
+            st.rerun()
+
+        # Add/Submit buttons (both must be form_submit_button)
+        col_add, col_submit = st.columns([1, 3])
+        with col_add:
+            add_clicked = st.form_submit_button("+ Add Item", key="add_item")
+        with col_submit:
+            submitted = st.form_submit_button("Submit Form", type="primary", key="submit_form")
+
+        if add_clicked:
+            st.session_state.form_items.append({'name': '', 'quantity': 1})
+            st.rerun()
 
         if submitted:
             errors = []
