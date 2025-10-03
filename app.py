@@ -420,11 +420,13 @@ def show_main_form():
     st.markdown('<div class="main-header"><h3>LNMIIT Item Issue Form</h3></div>', unsafe_allow_html=True)
     st.write(f"Welcome, {st.session_state.user_name} ({st.session_state.user_email})")
 
+    # Logout (form ke bahar)
     if st.button("Logout"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
 
+    # Static lists
     departments = [
         'Communication and Computer Engineering',
         'Computer Science and Engineering',
@@ -437,11 +439,17 @@ def show_main_form():
         'Speakers','Arduino Board','Raspberry Pi','Breadboard','Multimeter','Oscilloscope'
     ]
 
+    from datetime import date, timedelta
+    default_return = date.today() + timedelta(days=1)
+
     with st.form("item_issue_form"):
+        # Top fields
         col1, col2, col3 = st.columns(3)
         with col1:
-            user_type = st.selectbox("User Type", ["student","faculty","staff"],
-                                     index=["student","faculty","staff"].index(st.session_state.get("user_type","student")))
+            user_type = st.selectbox(
+                "User Type", ["student","faculty","staff"],
+                index=["student","faculty","staff"].index(st.session_state.get("user_type","student"))
+            )
         with col2:
             name = st.text_input("Name", value=st.session_state.user_name)
         with col3:
@@ -464,17 +472,14 @@ def show_main_form():
         with col1:
             issue_date = st.date_input("Issue Date", value=date.today())
         with col2:
-            return_date = st.date_input("Return Date")
+            return_date = st.date_input("Return Date", value=default_return)
 
-                # Items section
+        # ========== ITEMS SECTION ==========
         st.markdown("### 📦 Items to Issue")
 
-        # Initialize items in session state
         if 'form_items' not in st.session_state:
             st.session_state.form_items = [{'name': '', 'quantity': 1}]
 
-        # Render rows (buttons inside form must be form_submit_button)
-        remove_triggered = False
         remove_index = None
 
         for i, it in enumerate(st.session_state.form_items):
@@ -501,35 +506,34 @@ def show_main_form():
 
             with c3:
                 if len(st.session_state.form_items) > 1:
-                    rm = st.form_submit_button("Remove", key=f"remove_{i}")
-                    if rm:
-                        remove_triggered = True
+                    # IMPORTANT: form ke andar sirf form_submit_button use karein; key mat de
+                    if st.form_submit_button(f"Remove {i+1}"):
                         remove_index = i
 
-            # Update this row
             st.session_state.form_items[i] = {'name': item_name, 'quantity': qty}
 
-        # If any remove clicked → update list and rerun
-        if remove_triggered and remove_index is not None:
+        if remove_index is not None:
             st.session_state.form_items.pop(remove_index)
             st.rerun()
 
-        # Add and Submit must also be form_submit_button (inside form)
         col_add, col_submit = st.columns([1, 3])
         with col_add:
-            add_clicked = st.form_submit_button("+ Add Item", key="add_item")
+            add_clicked = st.form_submit_button("➕ Add Item")  # no key
         with col_submit:
-            submitted = st.form_submit_button("Submit Form", type="primary", key="submit_form")
+            submitted = st.form_submit_button("Submit Form", type="primary")  # no key
 
         if add_clicked:
             st.session_state.form_items.append({'name': '', 'quantity': 1})
             st.rerun()
+        # ========== END ITEMS SECTION ==========
 
+        # Submit handling
         if submitted:
             errors = []
             if not name: errors.append("Name is required")
             if not user_id: errors.append("ID is required")
             if not department: errors.append("Department is required")
+            import re
             if not mobile or not re.match(r'^\d{10}$', mobile): errors.append("Valid 10-digit mobile number is required")
             if user_type=="student" and not instructor_name: errors.append("Instructor name is required for students")
             if not return_date or return_date <= issue_date: errors.append("Return date must be after issue date")
