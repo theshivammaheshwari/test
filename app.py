@@ -4,6 +4,7 @@ import pandas as pd
 import re
 import json
 import io
+import os
 from datetime import datetime, date, timedelta
 import hashlib, secrets, hmac
 
@@ -12,6 +13,7 @@ st.set_page_config(page_title="LNMIIT Item Issue Form", page_icon="🎓", layout
 
 ADMIN_EMAIL = st.secrets.get("admin", {}).get("email", "smaheshwari@lnmiit.ac.in")
 ADMIN_INITIAL_PASSWORD = st.secrets.get("admin", {}).get("initial_password", "ChangeMe@123!")
+CSV_PATH = "items.csv"  # inventory CSV at repo root
 
 # --------------- Styling ------------------
 st.markdown("""
@@ -92,17 +94,7 @@ def init_database():
     add_column_if_missing(conn, "form_submissions", "reviewed_at", "TIMESTAMP")
     add_column_if_missing(conn, "form_submissions", "approved_by", "TEXT")
 
-    # Inventory
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS inventory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE,
-            quantity INTEGER DEFAULT 0,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
     conn.commit()
-
     ensure_admin_user(conn)
     conn.close()
 
@@ -137,10 +129,10 @@ def verify_password(password: str, salt: str, stored_hash_hex: str):
 
 # --------------- Notifications (TEMP DISABLED) ---------------
 def notify_admin_submission(form_data):
-    return  # notifications disabled for now
+    return  # notifications disabled
 
 def notify_user_decision(user_email, decision, comment, items):
-    return  # notifications disabled for now
+    return  # notifications disabled
 
 # --------------- DB Ops (Users/Auth) ---------------
 def validate_lnmiit_email(email):
@@ -207,7 +199,106 @@ def reset_password(email, code, new_password):
     conn.commit(); conn.close()
     return True, "Password updated successfully."
 
-# --------------- DB Ops (Forms & Inventory) ---------------
+# --------------- CSV-backed Inventory ---------------
+def _normalize_inventory_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+    if "name" not in df.columns:
+        if "Name of Equipment" in df.columns:
+            df = df.rename(columns={"Name of Equipment": "name"})
+        elif "item" in df.columns:
+            df = df.rename(columns={"item": "name"})
+    if "quantity" not in df.columns:
+        if "Quantity" in df.columns:
+            df = df.rename(columns={"Quantity": "quantity"})
+        elif "qty" in df.columns:
+            df = df.rename(columns={"qty": "quantity"})
+    if "name" not in df.columns or "quantity" not in df.columns:
+        return pd.DataFrame(columns=["name", "quantity"])
+    df["name"] = df["name"].astype(str).str.strip()
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).astype(int)
+    df = df.groupby("name", as_index=False)["quantity"].sum()
+    df["quantity"] = df["quantity"].clip(lower=0)
+    return df[["name", "quantity"]]
+
+def _read_inventory_csv() -> pd.DataFrame:
+    if not os.path.exists(CSV_PATH):
+        return pd.DataFrame(columns=["name", "quantity"])
+    try:
+        raw = pd.read_csv(CSV_PATH)
+    except Exception:
+        return pd.DataFrame(columns=["name", "quantity"])
+    return _normalize_inventory_df(raw)
+
+def _write_inventory_csv(df: pd.DataFrame):
+    df = _normalize_inventory_df(df)
+    out = df.rename(columns={"name": "Name of Equipment", "quantity": "Quantity"})
+    out.to_csv(CSV_PATH, index=False, encoding="utf-8")
+
+def inv_get_all() -> pd.DataFrame:
+    return _read_inventory_csv()
+
+def inv_get_qty(name: str) -> int:
+    df = _read_inventory_csv()
+    if df.empty:
+        return 0
+    mask = df["name"].str.lower() == (name or "").strip().lower()
+    if not mask.any():
+        return 0
+    return int(df.loc[mask, "quantity"].iloc[0])
+
+def inv_upsert_set(name: str, qty: int):
+    name = (name or "").strip()
+    if not name:
+        return
+    qty = int(qty or 0)
+    df = _read_inventory_csv()
+    if df.empty:
+        df = pd.DataFrame([{"name": name, "quantity": max(0, qty)}])
+    else:
+        mask = df["name"].str.lower() == name.lower()
+        if mask.any():
+            df.loc[mask, "quantity"] = max(0, qty)
+        else:
+            df = pd.concat([df, pd.DataFrame([{"name": name, "quantity": max(0, qty)}])], ignore_index=True)
+    _write_inventory_csv(df)
+
+def inv_adjust(name: str, delta: int):
+    name = (name or "").strip()
+    if not name:
+        return
+    df = _read_inventory_csv()
+    if df.empty:
+        df = pd.DataFrame([{"name": name, "quantity": max(0, int(delta or 0))}])
+    else:
+        mask = df["name"].str.lower() == name.lower()
+        if mask.any():
+            new_qty = int(df.loc[mask, "quantity"].iloc[0]) + int(delta or 0)
+            df.loc[mask, "quantity"] = max(0, new_qty)
+        else:
+            df = pd.concat(
+                [df, pd.DataFrame([{"name": name, "quantity": max(0, int(delta or 0))}])],
+                ignore_index=True
+            )
+    _write_inventory_csv(df)
+
+def check_availability(items):
+    shortages = []
+    for it in items:
+        req = int(it.get('quantity', 0) or 0)
+        if req <= 0: continue
+        avail = inv_get_qty(it['name'])
+        if avail < req:
+            shortages.append({"name": it['name'], "requested": req, "available": avail})
+    return len(shortages) == 0, shortages
+
+def decrement_inventory(items):
+    for it in items:
+        qty = int(it.get('quantity', 0) or 0)
+        if qty <= 0: continue
+        inv_adjust(it['name'], -qty)
+
+# --------------- DB Ops (Forms) ---------------
 def save_form_submission(form_data):
     conn = get_conn(); cur = conn.cursor()
     items_json = json.dumps(form_data['items'])
@@ -225,63 +316,6 @@ def get_all_submissions():
     df = pd.read_sql_query('SELECT * FROM form_submissions ORDER BY submitted_at DESC', conn)
     conn.close()
     return df
-
-def get_submission(sid: int):
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT * FROM form_submissions WHERE id=?", (sid,))
-    row = cur.fetchone()
-    cols = [d[0] for d in cur.description] if cur.description else []
-    conn.close()
-    if not row: return None
-    rec = dict(zip(cols, row))
-    try:
-        rec['items'] = json.loads(rec['items']) if rec.get('items') else []
-    except:
-        rec['items'] = []
-    return rec
-
-def inv_get_all():
-    conn = get_conn()
-    df = pd.read_sql_query('SELECT id, name, quantity, updated_at FROM inventory ORDER BY name ASC', conn)
-    conn.close()
-    return df
-
-def inv_get_qty(name: str) -> int:
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT quantity FROM inventory WHERE lower(name)=lower(?)", (name,))
-    row = cur.fetchone()
-    conn.close()
-    return int(row[0]) if row else 0
-
-def inv_upsert_set(name: str, qty: int):
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT id FROM inventory WHERE lower(name)=lower(?)", (name,))
-    row = cur.fetchone()
-    if row:
-        cur.execute("UPDATE inventory SET quantity=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (qty, row[0]))
-    else:
-        cur.execute("INSERT INTO inventory (name, quantity) VALUES (?, ?)", (name, max(0, qty)))
-    conn.commit(); conn.close()
-
-def inv_adjust(name: str, delta: int):
-    current = inv_get_qty(name)
-    inv_upsert_set(name, max(0, current + delta))
-
-def check_availability(items):
-    shortages = []
-    for it in items:
-        req = int(it.get('quantity', 0) or 0)
-        if req <= 0: continue
-        avail = inv_get_qty(it['name'])
-        if avail < req:
-            shortages.append({"name": it['name'], "requested": req, "available": avail})
-    return len(shortages) == 0, shortages
-
-def decrement_inventory(items):
-    for it in items:
-        qty = int(it.get('quantity', 0) or 0)
-        if qty <= 0: continue
-        inv_adjust(it['name'], -qty)
 
 def mark_submission(sid: int, status: str, admin_email: str, comment: str = ""):
     conn = get_conn(); cur = conn.cursor()
@@ -374,7 +408,7 @@ def auth_ui():
             email = st.text_input("Enter your registered LNMIIT email")
             c1, c2 = st.columns(2)
             with c1:
-                send = st.form_submit_button("Send reset code", type="primary")
+                send = st.form_submit_button("Generate reset code", type="primary")
             with c2:
                 back = st.form_submit_button("Back to login")
             if back:
@@ -386,8 +420,8 @@ def auth_ui():
                     st.error("No account found with this email.")
                 else:
                     code = set_reset_code(email)
-                    # Email disabled: show code in UI for testing (remove later)
-                    st.info(f"Debug reset code (email off): {code}")
+                    # Email off: show code for testing (remove in production)
+                    st.info(f"Reset code (debug): {code}")
                     st.session_state.reset_email = email
                     st.session_state.auth_mode = "reset"
                     st.success("Reset code generated.")
@@ -424,10 +458,7 @@ def show_main_form():
         st.rerun()
 
     inv_df = inv_get_all()
-    available_items = inv_df['name'].tolist() if not inv_df.empty else [
-        'Laptop','Projector','HDMI Cable','Extension Board','Webcam','Microphone',
-        'Speakers','Arduino Board','Raspberry Pi','Breadboard','Multimeter','Oscilloscope'
-    ]
+    available_items = inv_df['name'].tolist()
 
     departments = [
         'Communication and Computer Engineering',
@@ -521,7 +552,7 @@ def show_main_form():
                 try:
                     save_form_submission(form_data)
                     st.success("✅ Form submitted! Your request is pending approval.")
-                    notify_admin_submission(form_data)  # no-op for now
+                    notify_admin_submission(form_data)  # no-op
                     st.session_state.form_items = [{'name':'','quantity':1}]
                     with st.expander("📋 Submitted Data"):
                         st.json(form_data)
@@ -580,13 +611,13 @@ def show_admin_panel():
                             else:
                                 decrement_inventory(items_list)
                                 mark_submission(int(row['id']), "approved", st.session_state.user_email, comment)
-                                notify_user_decision(row['user_email'], "approved", comment, items_list)  # no-op now
+                                notify_user_decision(row['user_email'], "approved", comment, items_list)  # no-op
                                 st.success("Approved and stock updated.")
                                 st.rerun()
 
                         if reject:
                             mark_submission(int(row['id']), "rejected", st.session_state.user_email, comment)
-                            notify_user_decision(row['user_email'], "rejected", comment, items_list)  # no-op now
+                            notify_user_decision(row['user_email'], "rejected", comment, items_list)  # no-op
                             st.warning("Rejected.")
                             st.rerun()
 
@@ -595,9 +626,44 @@ def show_admin_panel():
         st.subheader("Inventory")
         inv = inv_get_all()
         if inv.empty:
-            st.info("No items in inventory. Add some below.")
+            st.info("No items in inventory. Add or import CSV below.")
         else:
-            st.dataframe(inv, use_container_width=True)
+            st.dataframe(inv.rename(columns={"name":"Name of Equipment","quantity":"Quantity"}), use_container_width=True)
+
+        # CSV Import / Download
+        st.markdown("##### CSV Inventory (items.csv at repo root)")
+        col_imp, col_exp = st.columns(2)
+        with col_imp:
+            with st.form("import_csv_form"):
+                uploaded = st.file_uploader("Upload items.csv (Name of Equipment, Quantity)", type=["csv"])
+                imp = st.form_submit_button("Import CSV")
+                if imp:
+                    if uploaded is None:
+                        st.error("Please choose a CSV file.")
+                    else:
+                        try:
+                            tmp = pd.read_csv(uploaded)
+                            tmp = _normalize_inventory_df(tmp)
+                            if tmp.empty:
+                                st.error("CSV must have columns: Name of Equipment, Quantity")
+                            else:
+                                _write_inventory_csv(tmp)
+                                st.success("Inventory imported from CSV.")
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to import CSV: {e}")
+        with col_exp:
+            cur_df = inv_get_all()
+            if cur_df.empty:
+                st.info("No inventory yet to download.")
+            else:
+                download_df = cur_df.rename(columns={"name":"Name of Equipment","quantity":"Quantity"})
+                st.download_button(
+                    "⬇️ Download current items.csv",
+                    data=download_df.to_csv(index=False).encode("utf-8"),
+                    file_name="items.csv",
+                    mime="text/csv"
+                )
 
         st.markdown("##### Add or Set Quantity")
         with st.form("add_set_form"):
