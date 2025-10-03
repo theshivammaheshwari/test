@@ -2,56 +2,58 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import re
-from datetime import datetime, date
 import json
 import io
-# Page configuration
-st.set_page_config(
-    page_title="LNMIIT Item Issue Form",
-    page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+import smtplib, ssl
+from email.message import EmailMessage
+from datetime import datetime, date, timedelta
+import hashlib, secrets, hmac
 
-# Custom CSS
+# ----------------- Config -----------------
+st.set_page_config(page_title="LNMIIT Item Issue Form", page_icon="🎓", layout="wide")
+
+ADMIN_EMAIL = st.secrets.get("admin", {}).get("email", "smaheshwari@lnmiit.ac.in")
+ADMIN_INITIAL_PASSWORD = st.secrets.get("admin", {}).get("initial_password", "ChangeMe@123!")
+
+SMTP_CONF = {
+    "host": st.secrets.get("smtp", {}).get("host"),
+    "port": st.secrets.get("smtp", {}).get("port", 587),
+    "user": st.secrets.get("smtp", {}).get("user"),
+    "password": st.secrets.get("smtp", {}).get("password"),
+    "use_tls": st.secrets.get("smtp", {}).get("use_tls", True),
+    "send_to": st.secrets.get("smtp", {}).get("send_to", ADMIN_EMAIL),
+}
+
+# --------------- Styling ------------------
 st.markdown("""
 <style>
     .main-header {
         background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        padding: 1rem;
-        border-radius: 10px;
-        margin-bottom: 2rem;
-    }
-    .form-container {
-        background: white;
-        padding: 2rem;
-        border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
-    .success-message {
-        background: #d4edda;
-        color: #155724;
-        padding: 1rem;
-        border-radius: 5px;
-        border-left: 4px solid #28a745;
-    }
-    .error-message {
-        background: #f8d7da;
-        color: #721c24;
-        padding: 1rem;
-        border-radius: 5px;
-        border-left: 4px solid #dc3545;
+        padding: 1rem; border-radius: 10px; margin-bottom: 1rem;
+        color: white;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Database initialization
+
+# --------------- DB Helpers ----------------
+def get_conn():
+    return sqlite3.connect('lnmiit_forms.db', detect_types=sqlite3.PARSE_DECLTYPES)
+
+def add_column_if_missing(conn, table, column, coldef):
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    if column not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
+        conn.commit()
+
 def init_database():
-    conn = sqlite3.connect('lnmiit_forms.db')
-    cursor = conn.cursor()
-    
-    # Users table
-    cursor.execute('''
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Users table (now with password + salt + flags + reset fields)
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE,
@@ -60,9 +62,15 @@ def init_database():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
+    # Add new columns (migrations)
+    add_column_if_missing(conn, "users", "password_hash", "TEXT")
+    add_column_if_missing(conn, "users", "salt", "TEXT")
+    add_column_if_missing(conn, "users", "is_admin", "INTEGER DEFAULT 0")
+    add_column_if_missing(conn, "users", "reset_code", "TEXT")
+    add_column_if_missing(conn, "users", "reset_expires", "TIMESTAMP")
+
     # Forms table
-    cursor.execute('''
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS form_submissions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_email TEXT,
@@ -79,381 +87,509 @@ def init_database():
             FOREIGN KEY (user_email) REFERENCES users (email)
         )
     ''')
-    
-    # Admin users table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS admin_users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Insert default admin
-    cursor.execute('''
-        INSERT OR IGNORE INTO admin_users (email) 
-        VALUES ('admin@lnmiit.ac.in')
-    ''')
-    
     conn.commit()
+
+    # Ensure admin user exists with password
+    ensure_admin_user(conn)
     conn.close()
 
-# Email validation
+def ensure_admin_user(conn):
+    # If admin not present, create with initial password
+    cur = conn.cursor()
+    cur.execute("SELECT id, password_hash, salt FROM users WHERE email = ?", (ADMIN_EMAIL,))
+    row = cur.fetchone()
+    if row is None or row[1] is None or row[2] is None:
+        salt, pwd_hash = hash_password(ADMIN_INITIAL_PASSWORD)
+        if row is None:
+            cur.execute('''
+                INSERT INTO users (email, name, user_type, password_hash, salt, is_admin)
+                VALUES (?, ?, ?, ?, ?, 1)
+            ''', (ADMIN_EMAIL, "Admin", "admin", pwd_hash, salt))
+        else:
+            cur.execute('''
+                UPDATE users SET password_hash=?, salt=?, is_admin=1, user_type='admin', name='Admin'
+                WHERE email=?
+            ''', (pwd_hash, salt, ADMIN_EMAIL))
+        conn.commit()
+
+# --------------- Password Security ---------------
+def hash_password(password: str, salt: str | None = None):
+    if salt is None:
+        salt = secrets.token_hex(16)  # 32 hex chars = 16 bytes
+    dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt), 200_000)
+    return salt, dk.hex()
+
+def verify_password(password: str, salt: str, stored_hash_hex: str):
+    calc = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt), 200_000).hex()
+    return hmac.compare_digest(calc, stored_hash_hex)
+
+# --------------- Email ----------------
+def send_email(to_email, subject, body):
+    if not SMTP_CONF["host"] or not SMTP_CONF["user"] or not SMTP_CONF["password"]:
+        # No SMTP configured; log to console
+        print("Email skipped (SMTP not configured):")
+        print("To:", to_email)
+        print("Subject:", subject)
+        print(body)
+        return False
+
+    msg = EmailMessage()
+    msg["From"] = SMTP_CONF["user"]
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        if SMTP_CONF["use_tls"]:
+            context = ssl.create_default_context()
+            with smtplib.SMTP(SMTP_CONF["host"], SMTP_CONF["port"]) as server:
+                server.starttls(context=context)
+                server.login(SMTP_CONF["user"], SMTP_CONF["password"])
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP_SSL(SMTP_CONF["host"], SMTP_CONF["port"]) as server:
+                server.login(SMTP_CONF["user"], SMTP_CONF["password"])
+                server.send_message(msg)
+        return True
+    except Exception as e:
+        st.warning(f"Email send failed: {e}")
+        return False
+
+def notify_admin_submission(form_data):
+    subject = f"New Item Issue Submission: {form_data['name']} ({form_data['user_type']})"
+    items_text = "\n".join([f"- {it['name']} x {it['quantity']}" for it in form_data['items']])
+    body = f"""
+A new form has been submitted.
+
+Name: {form_data['name']}
+Email: {form_data['email']}
+User Type: {form_data['user_type']}
+ID: {form_data['user_id']}
+Department: {form_data['department']}
+Instructor: {form_data['instructor_name'] or '-'}
+
+Mobile: {form_data['mobile']}
+Issue Date: {form_data['issue_date']}
+Return Date: {form_data['return_date']}
+
+Items:
+{items_text}
+
+Submitted at: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+"""
+    send_email(SMTP_CONF["send_to"], subject, body)
+
+def send_reset_code_email(email, code):
+    subject = "LNMIIT Account Password Reset Code"
+    body = f"""
+We received a request to reset your password.
+
+Your reset code is: {code}
+
+This code will expire in 15 minutes.
+If you did not request this, you can ignore this email.
+"""
+    send_email(email, subject, body)
+
+# --------------- DB Operations ---------------
 def validate_lnmiit_email(email):
-    pattern = r'^[a-zA-Z0-9._%+-]+@lnmiit\.ac\.in$'
-    return re.match(pattern, email) is not None
+    return re.match(r'^[a-zA-Z0-9._%+-]+@lnmiit\.ac\.in$', email or "") is not None
 
-# Check if user is admin
-def is_admin(email):
-    conn = sqlite3.connect('lnmiit_forms.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT email FROM admin_users WHERE email = ?', (email,))
-    result = cursor.fetchone()
+def get_user(email):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT email, name, user_type, password_hash, salt, is_admin FROM users WHERE email = ?", (email,))
+    row = cur.fetchone()
     conn.close()
-    return result is not None
+    if not row:
+        return None
+    return {
+        "email": row[0],
+        "name": row[1],
+        "user_type": row[2],
+        "password_hash": row[3],
+        "salt": row[4],
+        "is_admin": bool(row[5])
+    }
 
-# Save user to database
-def save_user(email, name, user_type):
-    conn = sqlite3.connect('lnmiit_forms.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO users (email, name, user_type)
-        VALUES (?, ?, ?)
-    ''', (email, name, user_type))
+def register_user(email, name, user_type, password):
+    if not validate_lnmiit_email(email):
+        raise ValueError("Only @lnmiit.ac.in email is allowed")
+    if email.lower() == ADMIN_EMAIL.lower():
+        raise ValueError("This email is reserved for Admin. Please contact admin.")
+    salt, pwd_hash = hash_password(password)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (email, name, user_type, password_hash, salt, is_admin) VALUES (?, ?, ?, ?, ?, 0)",
+                (email, name, user_type, pwd_hash, salt))
     conn.commit()
     conn.close()
 
-# Save form submission
+def authenticate(email, password):
+    u = get_user(email)
+    if not u or not u["password_hash"] or not u["salt"]:
+        return False, None
+    ok = verify_password(password, u["salt"], u["password_hash"])
+    return (ok, u if ok else None)
+
+def set_reset_code(email):
+    # Create 6-digit code
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    expires = datetime.now() + timedelta(minutes=15)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET reset_code=?, reset_expires=? WHERE email=?",
+                (code, expires, email))
+    conn.commit()
+    conn.close()
+    return code
+
+def reset_password(email, code, new_password):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT reset_code, reset_expires FROM users WHERE email=?", (email,))
+    row = cur.fetchone()
+    if not row or not row[0] or not row[1]:
+        conn.close()
+        return False, "No reset request found. Please request again."
+    saved_code, expires = row
+    # Compare and expiry
+    if code != saved_code:
+        conn.close()
+        return False, "Invalid code."
+    try:
+        exp_dt = pd.to_datetime(expires)
+    except:
+        exp_dt = datetime.now() - timedelta(seconds=1)
+    if datetime.now() > exp_dt:
+        conn.close()
+        return False, "Code expired. Please request a new one."
+    # Set new password
+    salt, pwd_hash = hash_password(new_password)
+    cur.execute("UPDATE users SET password_hash=?, salt=?, reset_code=NULL, reset_expires=NULL WHERE email=?",
+                (pwd_hash, salt, email))
+    conn.commit()
+    conn.close()
+    return True, "Password updated successfully."
+
+# --------------- Data Ops ---------------
 def save_form_submission(form_data):
-    conn = sqlite3.connect('lnmiit_forms.db')
-    cursor = conn.cursor()
-    
+    conn = get_conn()
+    cur = conn.cursor()
     items_json = json.dumps(form_data['items'])
-    
-    cursor.execute('''
+    cur.execute('''
         INSERT INTO form_submissions 
-        (user_email, name, user_type, user_id, department, instructor_name, 
-         mobile, issue_date, return_date, items)
+        (user_email, name, user_type, user_id, department, instructor_name, mobile, issue_date, return_date, items)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        form_data['email'], form_data['name'], form_data['user_type'],
-        form_data['user_id'], form_data['department'], form_data['instructor_name'],
-        form_data['mobile'], form_data['issue_date'], form_data['return_date'],
-        items_json
-    ))
-    
+    ''', (form_data['email'], form_data['name'], form_data['user_type'], form_data['user_id'],
+          form_data['department'], form_data['instructor_name'], form_data['mobile'],
+          form_data['issue_date'], form_data['return_date'], items_json))
     conn.commit()
     conn.close()
 
-# Get all submissions (for admin)
 def get_all_submissions():
-    conn = sqlite3.connect('lnmiit_forms.db')
-    df = pd.read_sql_query('''
-        SELECT * FROM form_submissions 
-        ORDER BY submitted_at DESC
-    ''', conn)
+    conn = get_conn()
+    df = pd.read_sql_query('SELECT * FROM form_submissions ORDER BY submitted_at DESC', conn)
     conn.close()
     return df
 
-# Authentication function
-def authenticate_user():
-    if 'authenticated' not in st.session_state:
+# --------------- Auth UI ---------------
+def auth_ui():
+    if "auth_mode" not in st.session_state:
+        st.session_state.auth_mode = "login"
+    if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
-    
-    if not st.session_state.authenticated:
-        st.markdown('<div class="main-header">', unsafe_allow_html=True)
-        st.markdown("# 🎓 LNMIIT Item Issue Form")
-        st.markdown("## The LNM Institute of Information Technology")
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        st.markdown("### 🔐 Login with LNMIIT Email")
-        
-        with st.form("login_form"):
-            email = st.text_input("Email Address", placeholder="username@lnmiit.ac.in")
-            name = st.text_input("Full Name")
-            user_type = st.selectbox("User Type", ["student", "faculty", "staff"])
-            
-            submitted = st.form_submit_button("Login")
-            
-            if submitted:
-                if not email or not name:
-                    st.error("Please fill all fields")
-                elif not validate_lnmiit_email(email):
-                    st.error("Please use a valid LNMIIT email address (@lnmiit.ac.in)")
-                else:
-                    # Save user and authenticate
-                    save_user(email, name, user_type)
-                    st.session_state.authenticated = True
-                    st.session_state.user_email = email
-                    st.session_state.user_name = name
-                    st.session_state.user_type = user_type
-                    st.success("Login successful!")
-                    st.rerun()
-        
-        return False
-    
-    return True
 
-# Main form
-def show_main_form():
     st.markdown('<div class="main-header">', unsafe_allow_html=True)
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.markdown("# 🎓 LNMIIT Item Issue Form")
-        st.markdown("## The LNM Institute of Information Technology")
-    with col2:
-        if st.button("Logout"):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.rerun()
+    st.markdown("## 🎓 The LNM Institute of Information Technology")
+    st.markdown("### 🔐 Account Access")
     st.markdown('</div>', unsafe_allow_html=True)
-    
-    # Welcome message
-    st.markdown(f"### Welcome, {st.session_state.user_name}!")
-    
-    # Departments list
+
+    mode = st.session_state.auth_mode
+
+    if mode == "login":
+        with st.form("login_form"):
+            email = st.text_input("Email", placeholder="username@lnmiit.ac.in")
+            password = st.text_input("Password", type="password")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                submitted = st.form_submit_button("Login", type="primary")
+            with col2:
+                if st.form_submit_button("Register"):
+                    st.session_state.auth_mode = "register"; st.experimental_rerun()
+            with col3:
+                if st.form_submit_button("Forgot password"):
+                    st.session_state.auth_mode = "forgot"; st.experimental_rerun()
+
+            if submitted:
+                ok, user = authenticate(email, password)
+                if ok:
+                    st.session_state.authenticated = True
+                    st.session_state.user_email = user["email"]
+                    st.session_state.user_name = user["name"]
+                    st.session_state.user_type = user["user_type"]
+                    st.session_state.is_admin = user["is_admin"]
+                    st.success("Login successful!")
+                    st.experimental_rerun()
+                else:
+                    st.error("Invalid email or password")
+
+    elif mode == "register":
+        with st.form("register_form"):
+            st.info("Only @lnmiit.ac.in emails are allowed to register.")
+            name = st.text_input("Full Name")
+            email = st.text_input("LNMIIT Email", placeholder="username@lnmiit.ac.in")
+            user_type = st.selectbox("User Type", ["student", "faculty", "staff"])
+            pwd = st.text_input("Password", type="password")
+            cpwd = st.text_input("Confirm Password", type="password")
+            c1, c2 = st.columns(2)
+            with c1:
+                reg = st.form_submit_button("Create account", type="primary")
+            with c2:
+                back = st.form_submit_button("Back to login")
+
+            if back:
+                st.session_state.auth_mode = "login"; st.experimental_rerun()
+
+            if reg:
+                try:
+                    if not name or not email or not pwd:
+                        st.error("All fields are required.")
+                    elif not validate_lnmiit_email(email):
+                        st.error("Please use a valid LNMIIT email (@lnmiit.ac.in).")
+                    elif pwd != cpwd:
+                        st.error("Passwords do not match.")
+                    elif len(pwd) < 8:
+                        st.error("Password must be at least 8 characters.")
+                    else:
+                        register_user(email, name, user_type, pwd)
+                        st.success("Account created! You can login now.")
+                        st.session_state.auth_mode = "login"; st.experimental_rerun()
+                except sqlite3.IntegrityError:
+                    st.error("This email is already registered.")
+                except Exception as e:
+                    st.error(str(e))
+
+    elif mode == "forgot":
+        with st.form("forgot_form"):
+            email = st.text_input("Enter your registered LNMIIT email")
+            c1, c2 = st.columns(2)
+            with c1:
+                send = st.form_submit_button("Send reset code", type="primary")
+            with c2:
+                back = st.form_submit_button("Back to login")
+            if back:
+                st.session_state.auth_mode = "login"; st.experimental_rerun()
+            if send:
+                if not validate_lnmiit_email(email):
+                    st.error("Please enter a valid LNMIIT email.")
+                elif not get_user(email):
+                    st.error("No account found with this email.")
+                else:
+                    code = set_reset_code(email)
+                    send_reset_code_email(email, code)
+                    st.session_state.reset_email = email
+                    st.session_state.auth_mode = "reset"
+                    st.success("Reset code sent to your email (check inbox/spam).")
+                    st.experimental_rerun()
+
+    elif mode == "reset":
+        with st.form("reset_form"):
+            email = st.text_input("Email", value=st.session_state.get("reset_email", ""), disabled=False)
+            code = st.text_input("Reset code", placeholder="6-digit code from email")
+            new_pwd = st.text_input("New password", type="password")
+            c1, c2 = st.columns(2)
+            with c1:
+                do = st.form_submit_button("Reset password", type="primary")
+            with c2:
+                back = st.form_submit_button("Back to login")
+            if back:
+                st.session_state.auth_mode = "login"; st.experimental_rerun()
+            if do:
+                ok, msg = reset_password(email, code, new_pwd)
+                if ok:
+                    st.success(msg)
+                    st.session_state.auth_mode = "login"; st.experimental_rerun()
+                else:
+                    st.error(msg)
+
+    return False
+
+# --------------- App UI (User) ---------------
+def show_main_form():
+    st.markdown('<div class="main-header"><h3>LNMIIT Item Issue Form</h3></div>', unsafe_allow_html=True)
+    st.write(f"Welcome, {st.session_state.user_name} ({st.session_state.user_email})")
+
+    if st.button("Logout"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.experimental_rerun()
+
     departments = [
         'Communication and Computer Engineering',
         'Computer Science and Engineering',
         'Electronics and Communication Engineering',
         'Mechanical-Mechatronics Engineering',
-        'Physics',
-        'Mathematics',
-        'Humanities and Social Sciences',
-        'Others'
+        'Physics', 'Mathematics', 'Humanities and Social Sciences', 'Others'
     ]
-    
-    # Available items (you can modify this list)
     available_items = [
-        'Laptop', 'Projector', 'HDMI Cable', 'Extension Board',
-        'Webcam', 'Microphone', 'Speakers', 'Arduino Board',
-        'Raspberry Pi', 'Breadboard', 'Multimeter', 'Oscilloscope'
+        'Laptop','Projector','HDMI Cable','Extension Board','Webcam','Microphone',
+        'Speakers','Arduino Board','Raspberry Pi','Breadboard','Multimeter','Oscilloscope'
     ]
-    
+
     with st.form("item_issue_form"):
-        st.markdown("### 📝 Form Details")
-        
-        # Basic Information
         col1, col2, col3 = st.columns(3)
-        
         with col1:
-            user_type = st.selectbox("User Type", ["student", "faculty", "staff"], 
-                                   index=["student", "faculty", "staff"].index(st.session_state.user_type))
-            
+            user_type = st.selectbox("User Type", ["student","faculty","staff"],
+                                     index=["student","faculty","staff"].index(st.session_state.get("user_type","student")))
         with col2:
             name = st.text_input("Name", value=st.session_state.user_name)
-            
         with col3:
-            user_id = st.text_input("Roll No" if user_type == "student" else "Employee No")
-        
-        # Department and Contact
+            user_id = st.text_input("Roll No" if user_type=="student" else "Employee No")
+
         col1, col2, col3 = st.columns(3)
-        
         with col1:
             department = st.selectbox("Department", [""] + departments)
             if department == "Others":
-                other_department = st.text_input("Please specify department")
-                department = other_department if other_department else department
-                
+                other = st.text_input("Please specify department")
+                department = other if other else department
         with col2:
             mobile = st.text_input("Mobile No", placeholder="10-digit number")
-            
         with col3:
             email = st.text_input("Email ID", value=st.session_state.user_email, disabled=True)
-        
-        # Instructor name for students
-        if user_type == "student":
-            instructor_name = st.text_input("Instructor Name")
-        else:
-            instructor_name = ""
-        
-        # Dates
+
+        instructor_name = st.text_input("Instructor Name") if user_type=="student" else ""
+
         col1, col2 = st.columns(2)
         with col1:
             issue_date = st.date_input("Issue Date", value=date.today())
         with col2:
             return_date = st.date_input("Return Date")
-        
-        # Items section
+
         st.markdown("### 📦 Items to Issue")
-        
-        # Initialize items in session state
         if 'form_items' not in st.session_state:
-            st.session_state.form_items = [{'name': '', 'quantity': 1}]
-        
-        # Display items
-        for i, item in enumerate(st.session_state.form_items):
-            col1, col2, col3 = st.columns([2, 1, 1])
-            
-            with col1:
-                item_name = st.selectbox(f"Item {i+1}", 
-                                       [""] + available_items + ["Other"], 
-                                       key=f"item_name_{i}")
+            st.session_state.form_items = [{'name':'','quantity':1}]
+        # Items rows
+        for i, it in enumerate(st.session_state.form_items):
+            c1, c2, c3 = st.columns([2,1,1])
+            with c1:
+                item_name = st.selectbox(f"Item {i+1}", [""]+available_items+["Other"], key=f"item_{i}")
                 if item_name == "Other":
-                    custom_item = st.text_input(f"Custom Item {i+1}", key=f"custom_item_{i}")
-                    item_name = custom_item if custom_item else item_name
-                
-            with col2:
-                quantity = st.number_input(f"Quantity {i+1}", min_value=1, value=1, key=f"quantity_{i}")
-                
-            with col3:
-                if len(st.session_state.form_items) > 1:
-                    if st.button(f"Remove {i+1}", key=f"remove_{i}"):
-                        st.session_state.form_items.pop(i)
-                        st.rerun()
-            
-            # Update session state
-            st.session_state.form_items[i] = {'name': item_name, 'quantity': quantity}
-        
-        # Add item button
+                    custom = st.text_input(f"Custom Item {i+1}", key=f"custom_{i}")
+                    if custom:
+                        item_name = custom
+            with c2:
+                qty = st.number_input(f"Qty {i+1}", min_value=1, value=it.get('quantity',1), key=f"qty_{i}")
+            with c3:
+                if len(st.session_state.form_items)>1:
+                    if st.button(f"Remove {i+1}", key=f"rm_{i}"):
+                        st.session_state.form_items.pop(i); st.experimental_rerun()
+            st.session_state.form_items[i] = {'name': item_name, 'quantity': qty}
         if st.button("+ Add Item"):
-            st.session_state.form_items.append({'name': '', 'quantity': 1})
-            st.rerun()
-        
-        # Form submission
+            st.session_state.form_items.append({'name':'','quantity':1}); st.experimental_rerun()
+
         submitted = st.form_submit_button("Submit Form", type="primary")
-        
+
         if submitted:
-            # Validation
             errors = []
-            
-            if not name:
-                errors.append("Name is required")
-            if not user_id:
-                errors.append("ID is required")
-            if not department:
-                errors.append("Department is required")
-            if not mobile or not re.match(r'^\d{10}$', mobile):
-                errors.append("Valid 10-digit mobile number is required")
-            if user_type == "student" and not instructor_name:
-                errors.append("Instructor name is required for students")
-            if not return_date or return_date <= issue_date:
-                errors.append("Return date must be after issue date")
-            
-            # Check items
-            valid_items = [item for item in st.session_state.form_items 
-                          if item['name'] and item['name'] != '']
-            if not valid_items:
-                errors.append("At least one item is required")
-            
+            if not name: errors.append("Name is required")
+            if not user_id: errors.append("ID is required")
+            if not department: errors.append("Department is required")
+            if not mobile or not re.match(r'^\d{10}$', mobile): errors.append("Valid 10-digit mobile number is required")
+            if user_type=="student" and not instructor_name: errors.append("Instructor name is required for students")
+            if not return_date or return_date <= issue_date: errors.append("Return date must be after issue date")
+            valid_items = [x for x in st.session_state.form_items if x['name']]
+            if not valid_items: errors.append("At least one item is required")
+
             if errors:
-                for error in errors:
-                    st.error(error)
+                for e in errors: st.error(e)
             else:
-                # Save form data
                 form_data = {
-                    'email': email,
-                    'name': name,
-                    'user_type': user_type,
-                    'user_id': user_id,
-                    'department': department,
-                    'instructor_name': instructor_name,
-                    'mobile': mobile,
-                    'issue_date': str(issue_date),
-                    'return_date': str(return_date),
-                    'items': valid_items
+                    'email': email, 'name': name, 'user_type': user_type, 'user_id': user_id,
+                    'department': department, 'instructor_name': instructor_name, 'mobile': mobile,
+                    'issue_date': str(issue_date), 'return_date': str(return_date), 'items': valid_items
                 }
-                
                 try:
                     save_form_submission(form_data)
                     st.success("✅ Form submitted successfully!")
-                    
-                    # Clear form items
-                    st.session_state.form_items = [{'name': '', 'quantity': 1}]
-                    
-                    # Show submitted data
-                    with st.expander("📋 View Submitted Data"):
+                    notify_admin_submission(form_data)
+                    st.session_state.form_items = [{'name':'','quantity':1}]
+                    with st.expander("📋 Submitted Data"):
                         st.json(form_data)
-                        
                 except Exception as e:
-                    st.error(f"Error submitting form: {str(e)}")
+                    st.error(f"Error submitting form: {e}")
 
-# Admin panel
+# --------------- Admin Panel ---------------
 def show_admin_panel():
-    st.markdown('<div class="main-header">', unsafe_allow_html=True)
-    st.markdown("# 👨‍💼 Admin Panel - LNMIIT Form Submissions")
-    st.markdown('</div>', unsafe_allow_html=True)
-    
+    st.markdown('<div class="main-header"><h3>Admin Panel - LNMIIT Form Submissions</h3></div>', unsafe_allow_html=True)
+    st.write(f"Logged in as: {st.session_state.user_email}")
+
     if st.button("Logout"):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
-    
-    # Get all submissions
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.experimental_rerun()
+
     df = get_all_submissions()
-    
     if df.empty:
-        st.info("No form submissions yet.")
-    else:
-        st.markdown(f"### 📊 Total Submissions: {len(df)}")
-        
-        # Filters
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            user_type_filter = st.selectbox("Filter by User Type", 
-                                          ["All"] + list(df['user_type'].unique()))
-        
-        with col2:
-            department_filter = st.selectbox("Filter by Department", 
-                                           ["All"] + list(df['department'].unique()))
-        
-        with col3:
-            date_filter = st.date_input("Filter by Date")
-        
-        # Apply filters
-        filtered_df = df.copy()
-        
-        if user_type_filter != "All":
-            filtered_df = filtered_df[filtered_df['user_type'] == user_type_filter]
-        
-        if department_filter != "All":
-            filtered_df = filtered_df[filtered_df['department'] == department_filter]
-        
-        # Display data
-        st.markdown("### 📋 Form Submissions")
-        
-        # Format items column for better display
-        display_df = filtered_df.copy()
-        display_df['items'] = display_df['items'].apply(
-            lambda x: ', '.join([f"{item['name']} ({item['quantity']})" 
-                               for item in json.loads(x)]) if x else ""
-        )
-        
-        st.dataframe(display_df, use_container_width=True)
-        
-                # Download options
-        col1, col2 = st.columns(2)
+        st.info("No submissions yet.")
+        return
 
-        with col1:
-            csv = filtered_df.to_csv(index=False)
-            st.download_button(
-                label="📥 Download CSV",
-                data=csv,
-                file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
+    st.markdown(f"### 📊 Total Submissions: {len(df)}")
 
-        with col2:
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                filtered_df.to_excel(writer, index=False)
-            st.download_button(
-                label="📊 Download Excel",
-                data=output.getvalue(),
-                file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        user_type_filter = st.selectbox("Filter by User Type", ["All"] + sorted(df['user_type'].dropna().unique().tolist()))
+    with col2:
+        department_filter = st.selectbox("Filter by Department", ["All"] + sorted(df['department'].dropna().unique().tolist()))
+    with col3:
+        date_filter = st.date_input("Filter by Date", value=None)
 
-# Main application
+    filtered = df.copy()
+    if user_type_filter != "All":
+        filtered = filtered[filtered['user_type'] == user_type_filter]
+    if department_filter != "All":
+        filtered = filtered[filtered['department'] == department_filter]
+    if date_filter:
+        filtered['submitted_at'] = pd.to_datetime(filtered['submitted_at'])
+        filtered = filtered[filtered['submitted_at'].dt.date == date_filter]
+
+    display_df = filtered.copy()
+    def items_to_text(x):
+        try:
+            arr = json.loads(x)
+            return ", ".join([f"{i['name']} ({i['quantity']})" for i in arr])
+        except:
+            return x
+    display_df['items'] = display_df['items'].apply(items_to_text)
+
+    st.dataframe(display_df, use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        csv = filtered.to_csv(index=False)
+        st.download_button("📥 Download CSV", data=csv,
+                           file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                           mime="text/csv")
+    with col2:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            filtered.to_excel(writer, index=False)
+        st.download_button("📊 Download Excel", data=output.getvalue(),
+                           file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# --------------- Main ---------------
 def main():
     init_database()
-    
-    if not authenticate_user():
-        return
-    
-    # Check if user is admin
-    if is_admin(st.session_state.user_email):
+
+    # Auth flow
+    if not st.session_state.get("authenticated", False):
+        auth_ui()
+        if not st.session_state.get("authenticated", False):
+            return  # stop here until logged in
+
+    # Post-auth routes
+    if st.session_state.get("is_admin", False) and st.session_state.get("user_email","").lower() == ADMIN_EMAIL.lower():
         show_admin_panel()
     else:
         show_main_form()
