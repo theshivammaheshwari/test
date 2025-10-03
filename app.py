@@ -316,10 +316,10 @@ def auth_ui():
                 submitted = st.form_submit_button("Login", type="primary")
             with col2:
                 if st.form_submit_button("Register"):
-                    st.session_state.auth_mode = "register"; st.experimental_rerun()
+                    st.session_state.auth_mode = "register"; st.rerun()
             with col3:
                 if st.form_submit_button("Forgot password"):
-                    st.session_state.auth_mode = "forgot"; st.experimental_rerun()
+                    st.session_state.auth_mode = "forgot"; st.rerun()
 
             if submitted:
                 ok, user = authenticate(email, password)
@@ -330,7 +330,7 @@ def auth_ui():
                     st.session_state.user_type = user["user_type"]
                     st.session_state.is_admin = user["is_admin"]
                     st.success("Login successful!")
-                    st.experimental_rerun()
+                    st.rerun()
                 else:
                     st.error("Invalid email or password")
 
@@ -349,7 +349,7 @@ def auth_ui():
                 back = st.form_submit_button("Back to login")
 
             if back:
-                st.session_state.auth_mode = "login"; st.experimental_rerun()
+                st.session_state.auth_mode = "login"; st.rerun()
 
             if reg:
                 try:
@@ -364,7 +364,7 @@ def auth_ui():
                     else:
                         register_user(email, name, user_type, pwd)
                         st.success("Account created! You can login now.")
-                        st.session_state.auth_mode = "login"; st.experimental_rerun()
+                        st.session_state.auth_mode = "login"; st.rerun()
                 except sqlite3.IntegrityError:
                     st.error("This email is already registered.")
                 except Exception as e:
@@ -379,7 +379,7 @@ def auth_ui():
             with c2:
                 back = st.form_submit_button("Back to login")
             if back:
-                st.session_state.auth_mode = "login"; st.experimental_rerun()
+                st.session_state.auth_mode = "login"; st.rerun()
             if send:
                 if not validate_lnmiit_email(email):
                     st.error("Please enter a valid LNMIIT email.")
@@ -391,7 +391,7 @@ def auth_ui():
                     st.session_state.reset_email = email
                     st.session_state.auth_mode = "reset"
                     st.success("Reset code sent to your email (check inbox/spam).")
-                    st.experimental_rerun()
+                    st.rerun()
 
     elif mode == "reset":
         with st.form("reset_form"):
@@ -404,12 +404,12 @@ def auth_ui():
             with c2:
                 back = st.form_submit_button("Back to login")
             if back:
-                st.session_state.auth_mode = "login"; st.experimental_rerun()
+                st.session_state.auth_mode = "login"; st.rerun()
             if do:
                 ok, msg = reset_password(email, code, new_pwd)
                 if ok:
                     st.success(msg)
-                    st.session_state.auth_mode = "login"; st.experimental_rerun()
+                    st.session_state.auth_mode = "login"; st.rerun()
                 else:
                     st.error(msg)
 
@@ -423,7 +423,7 @@ def show_main_form():
     if st.button("Logout"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
-        st.experimental_rerun()
+        st.rerun()
 
     departments = [
         'Communication and Computer Engineering',
@@ -483,10 +483,10 @@ def show_main_form():
             with c3:
                 if len(st.session_state.form_items)>1:
                     if st.button(f"Remove {i+1}", key=f"rm_{i}"):
-                        st.session_state.form_items.pop(i); st.experimental_rerun()
+                        st.session_state.form_items.pop(i); st.rerun()
             st.session_state.form_items[i] = {'name': item_name, 'quantity': qty}
         if st.button("+ Add Item"):
-            st.session_state.form_items.append({'name':'','quantity':1}); st.experimental_rerun()
+            st.session_state.form_items.append({'name':'','quantity':1}); st.rerun()
 
         submitted = st.form_submit_button("Submit Form", type="primary")
 
@@ -527,7 +527,7 @@ def show_admin_panel():
     if st.button("Logout"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
-        st.experimental_rerun()
+        st.rerun()
 
     df = get_all_submissions()
     if df.empty:
