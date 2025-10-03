@@ -4,8 +4,6 @@ import pandas as pd
 import re
 import json
 import io
-import smtplib, ssl
-from email.message import EmailMessage
 from datetime import datetime, date, timedelta
 import hashlib, secrets, hmac
 
@@ -14,15 +12,6 @@ st.set_page_config(page_title="LNMIIT Item Issue Form", page_icon="🎓", layout
 
 ADMIN_EMAIL = st.secrets.get("admin", {}).get("email", "smaheshwari@lnmiit.ac.in")
 ADMIN_INITIAL_PASSWORD = st.secrets.get("admin", {}).get("initial_password", "ChangeMe@123!")
-
-SMTP_CONF = {
-    "host": st.secrets.get("smtp", {}).get("host"),
-    "port": st.secrets.get("smtp", {}).get("port", 587),
-    "user": st.secrets.get("smtp", {}).get("user"),
-    "password": st.secrets.get("smtp", {}).get("password"),
-    "use_tls": st.secrets.get("smtp", {}).get("use_tls", True),
-    "send_to": st.secrets.get("smtp", {}).get("send_to", ADMIN_EMAIL),
-}
 
 # --------------- Styling ------------------
 st.markdown("""
@@ -40,27 +29,20 @@ def get_conn():
 
 def add_column_if_missing(conn, table, column, coldef, default_value=None):
     cur = conn.cursor()
-    # Check existing columns
     cur.execute(f"PRAGMA table_info({table})")
     cols = [r[1] for r in cur.fetchall()]
     if column in cols:
-        return  # already present
-
-    # Try adding with given definition
+        return
     try:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
         conn.commit()
-    except sqlite3.OperationalError as e:
-        # Fallback: add as TEXT only (some SQLite builds throw on DEFAULT in ALTER)
+    except sqlite3.OperationalError:
         try:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
             conn.commit()
         except sqlite3.OperationalError as e2:
-            # If still fails, just log and move on
-            print("Migration warning:", e, e2)
+            print("Migration warning:", e2)
             return
-
-    # Set default value for existing rows (if asked)
     if default_value is not None:
         try:
             cur.execute(f"UPDATE {table} SET {column}=? WHERE {column} IS NULL", (default_value,))
@@ -72,7 +54,7 @@ def init_database():
     conn = get_conn()
     cur = conn.cursor()
 
-    # Users table
+    # Users
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,14 +64,13 @@ def init_database():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # New cols
     add_column_if_missing(conn, "users", "password_hash", "TEXT")
     add_column_if_missing(conn, "users", "salt", "TEXT")
     add_column_if_missing(conn, "users", "is_admin", "INTEGER DEFAULT 0")
     add_column_if_missing(conn, "users", "reset_code", "TEXT")
     add_column_if_missing(conn, "users", "reset_expires", "TIMESTAMP")
 
-    # Forms table
+    # Forms
     cur.execute('''
         CREATE TABLE IF NOT EXISTS form_submissions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,13 +87,12 @@ def init_database():
             submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-        # Add workflow columns (safe migrations)
     add_column_if_missing(conn, "form_submissions", "status", "TEXT DEFAULT 'pending'", default_value="pending")
     add_column_if_missing(conn, "form_submissions", "admin_comment", "TEXT")
     add_column_if_missing(conn, "form_submissions", "reviewed_at", "TIMESTAMP")
     add_column_if_missing(conn, "form_submissions", "approved_by", "TEXT")
 
-    # Inventory table
+    # Inventory
     cur.execute('''
         CREATE TABLE IF NOT EXISTS inventory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,68 +135,12 @@ def verify_password(password: str, salt: str, stored_hash_hex: str):
     calc = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt), 200_000).hex()
     return hmac.compare_digest(calc, stored_hash_hex)
 
-# --------------- Email ----------------
-def send_email(to_email, subject, body):
-    if not SMTP_CONF["host"] or not SMTP_CONF["user"] or not SMTP_CONF["password"]:
-        print("Email skipped (SMTP not configured):", subject)
-        return False
-
-    msg = EmailMessage()
-    msg["From"] = SMTP_CONF["user"]
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.set_content(body)
-
-    try:
-        if SMTP_CONF["use_tls"]:
-            context = ssl.create_default_context()
-            with smtplib.SMTP(SMTP_CONF["host"], SMTP_CONF["port"]) as server:
-                server.starttls(context=context)
-                server.login(SMTP_CONF["user"], SMTP_CONF["password"])
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP_SSL(SMTP_CONF["host"], SMTP_CONF["port"]) as server:
-                server.login(SMTP_CONF["user"], SMTP_CONF["password"])
-                server.send_message(msg)
-        return True
-    except Exception as e:
-        st.warning(f"Email send failed: {e}")
-        return False
-
+# --------------- Notifications (TEMP DISABLED) ---------------
 def notify_admin_submission(form_data):
-    return  # no-op
-
-Name: {form_data['name']}
-Email: {form_data['email']}
-User Type: {form_data['user_type']}
-ID: {form_data['user_id']}
-Department: {form_data['department']}
-Instructor: {form_data['instructor_name'] or '-'}
-
-Mobile: {form_data['mobile']}
-Issue Date: {form_data['issue_date']}
-Return Date: {form_data['return_date']}
-
-Items:
-{items_text}
-
-Please log in to the admin panel to approve or reject.
-Submitted at: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-"""
-    send_email(SMTP_CONF["send_to"], subject, body)
+    return  # notifications disabled for now
 
 def notify_user_decision(user_email, decision, comment, items):
-    return  # no-op
-
-Items:
-{items_text}
-
-Comment: {comment or '-'}
-
-Regards,
-LNMIIT Lab
-"""
-    send_email(user_email, subject, body)
+    return  # notifications disabled for now
 
 # --------------- DB Ops (Users/Auth) ---------------
 def validate_lnmiit_email(email):
@@ -344,7 +268,6 @@ def inv_adjust(name: str, delta: int):
     inv_upsert_set(name, max(0, current + delta))
 
 def check_availability(items):
-    # items: [{'name':..., 'quantity':...}]
     shortages = []
     for it in items:
         req = int(it.get('quantity', 0) or 0)
@@ -463,17 +386,17 @@ def auth_ui():
                     st.error("No account found with this email.")
                 else:
                     code = set_reset_code(email)
-                    send_email(email, "LNMIIT Account Password Reset Code",
-                               f"Your reset code is: {code}\nIt will expire in 15 minutes.")
+                    # Email disabled: show code in UI for testing (remove later)
+                    st.info(f"Debug reset code (email off): {code}")
                     st.session_state.reset_email = email
                     st.session_state.auth_mode = "reset"
-                    st.success("Reset code sent to your email (check inbox/spam).")
+                    st.success("Reset code generated.")
                     st.rerun()
 
     elif mode == "reset":
         with st.form("reset_form"):
             email = st.text_input("Email", value=st.session_state.get("reset_email", ""))
-            code = st.text_input("Reset code", placeholder="6-digit code from email")
+            code = st.text_input("Reset code", placeholder="6-digit code")
             new_pwd = st.text_input("New password", type="password")
             c1, c2 = st.columns(2)
             with c1:
@@ -500,7 +423,6 @@ def show_main_form():
             del st.session_state[k]
         st.rerun()
 
-    # Inventory-based items list
     inv_df = inv_get_all()
     available_items = inv_df['name'].tolist() if not inv_df.empty else [
         'Laptop','Projector','HDMI Cable','Extension Board','Webcam','Microphone',
@@ -599,7 +521,7 @@ def show_main_form():
                 try:
                     save_form_submission(form_data)
                     st.success("✅ Form submitted! Your request is pending approval.")
-                    notify_admin_submission(form_data)
+                    notify_admin_submission(form_data)  # no-op for now
                     st.session_state.form_items = [{'name':'','quantity':1}]
                     with st.expander("📋 Submitted Data"):
                         st.json(form_data)
@@ -618,7 +540,7 @@ def show_admin_panel():
 
     tabs = st.tabs(["Approvals", "Inventory", "All Submissions"])
 
-    # Approvals tab
+    # Approvals
     with tabs[0]:
         st.subheader("Pending Approvals")
         df = get_all_submissions()
@@ -658,17 +580,17 @@ def show_admin_panel():
                             else:
                                 decrement_inventory(items_list)
                                 mark_submission(int(row['id']), "approved", st.session_state.user_email, comment)
-                                notify_user_decision(row['user_email'], "approved", comment, items_list)
+                                notify_user_decision(row['user_email'], "approved", comment, items_list)  # no-op now
                                 st.success("Approved and stock updated.")
                                 st.rerun()
 
                         if reject:
                             mark_submission(int(row['id']), "rejected", st.session_state.user_email, comment)
-                            notify_user_decision(row['user_email'], "rejected", comment, items_list)
+                            notify_user_decision(row['user_email'], "rejected", comment, items_list)  # no-op now
                             st.warning("Rejected.")
                             st.rerun()
 
-    # Inventory tab
+    # Inventory
     with tabs[1]:
         st.subheader("Inventory")
         inv = inv_get_all()
@@ -704,7 +626,7 @@ def show_admin_panel():
                     st.success("Updated.")
                     st.rerun()
 
-    # All submissions tab
+    # All submissions
     with tabs[2]:
         st.subheader("All Submissions")
         df = get_all_submissions()
@@ -752,15 +674,6 @@ def show_admin_panel():
                 st.download_button("📊 Download Excel", data=output.getvalue(),
                     file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    # Email Test tab
-    with tabs[3]:
-        st.subheader("Email diagnostics")
-        st.write(f"SMTP host: {SMTP_CONF['host']}")
-        st.write(f"SMTP user: {SMTP_CONF['user']}")
-        if st.button("Send test email to admin"):
-            ok = send_email(SMTP_CONF["send_to"], "Test mail", "This is a test from Streamlit.")
-            st.success("Sent!") if ok else st.error("Failed to send.")
 
 # --------------- Main ---------------
 def main():
