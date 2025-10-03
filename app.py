@@ -317,6 +317,11 @@ def get_all_submissions():
     conn.close()
     return df
 
+def update_submission_items(sid: int, items_list: list):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE form_submissions SET items=? WHERE id=?", (json.dumps(items_list), sid))
+    conn.commit(); conn.close()
+
 def mark_submission(sid: int, status: str, admin_email: str, comment: str = ""):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("""
@@ -586,39 +591,99 @@ def show_admin_panel():
                     items_list = json.loads(row['items'])
                 except:
                     items_list = []
+
                 with st.expander(f"#{row['id']} • {row['name']} • {row['user_type']} • {row['user_email']}"):
                     st.write(f"Department: {row['department']}")
                     st.write(f"ID: {row['user_id']}")
                     st.write(f"Issue: {row['issue_date']} | Return: {row['return_date']}")
-                    st.write("Items:")
-                    for it in items_list:
-                        st.write(f"- {it['name']} x {it['quantity']} (Available: {inv_get_qty(it['name'])})")
 
                     with st.form(f"review_form_{row['id']}"):
-                        comment = st.text_area("Admin comment (optional)", "")
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            approve = st.form_submit_button("✅ Approve")
-                        with c2:
-                            reject = st.form_submit_button("❌ Reject")
+                        st.markdown("##### Items (tick to approve and set qty)")
+                        approved_quantities = {}  # idx -> approved qty
+                        for i, it in enumerate(items_list):
+                            name = it.get('name', '')
+                            req_qty = int(it.get('quantity', 0) or 0)
+                            avail = inv_get_qty(name)
+                            max_approve = min(req_qty, avail) if avail is not None else 0
 
-                        if approve:
-                            ok, shortages = check_availability(items_list)
-                            if not ok:
-                                st.error("Insufficient stock for:")
-                                for sh in shortages:
-                                    st.write(f"- {sh['name']}: requested {sh['requested']}, available {sh['available']}")
+                            c1, c2, c3 = st.columns([3, 1, 1])
+                            with c1:
+                                sel = st.checkbox(
+                                    f"{name} • requested: {req_qty} • available: {avail}",
+                                    key=f"sel_{row['id']}_{i}",
+                                    value=False
+                                )
+                            with c2:
+                                qty_to_approve = st.number_input(
+                                    "Approve qty",
+                                    min_value=0,
+                                    max_value=int(max_approve),
+                                    value=0,
+                                    step=1,
+                                    key=f"appqty_{row['id']}_{i}"
+                                )
+                            with c3:
+                                st.write("")
+
+                            if sel and qty_to_approve > 0:
+                                approved_quantities[i] = int(qty_to_approve)
+
+                        comment = st.text_area("Admin comment (optional)", "", key=f"comment_{row['id']}")
+                        cA, cR = st.columns(2)
+                        with cA:
+                            approve_selected = st.form_submit_button("✅ Approve selected")
+                        with cR:
+                            reject_all = st.form_submit_button("❌ Reject all")
+
+                        if approve_selected:
+                            if not approved_quantities:
+                                st.error("Select at least one item and approve qty > 0.")
                             else:
-                                decrement_inventory(items_list)
-                                mark_submission(int(row['id']), "approved", st.session_state.user_email, comment)
-                                notify_user_decision(row['user_email'], "approved", comment, items_list)  # no-op
-                                st.success("Approved and stock updated.")
-                                st.rerun()
+                                # Validate availability again
+                                shortages = []
+                                for idx, qty in approved_quantities.items():
+                                    it = items_list[idx]
+                                    avail_now = inv_get_qty(it['name'])
+                                    if qty > avail_now:
+                                        shortages.append(f"- {it['name']}: approve {qty}, available {avail_now}")
+                                if shortages:
+                                    st.error("Insufficient stock for:")
+                                    for s in shortages:
+                                        st.write(s)
+                                else:
+                                    # Decrement inventory for selected items
+                                    to_decrement = []
+                                    for idx, qty in approved_quantities.items():
+                                        to_decrement.append({'name': items_list[idx]['name'], 'quantity': qty})
+                                    decrement_inventory(to_decrement)
 
-                        if reject:
-                            mark_submission(int(row['id']), "rejected", st.session_state.user_email, comment)
-                            notify_user_decision(row['user_email'], "rejected", comment, items_list)  # no-op
-                            st.warning("Rejected.")
+                                    # Remaining items = requested - approved
+                                    remaining = []
+                                    for idx, it in enumerate(items_list):
+                                        approved_q = int(approved_quantities.get(idx, 0))
+                                        rem = int(it.get('quantity', 0)) - approved_q
+                                        if rem > 0:
+                                            remaining.append({'name': it['name'], 'quantity': rem})
+
+                                    if remaining:
+                                        update_submission_items(int(row['id']), remaining)
+                                        mark_submission(int(row['id']), "pending",
+                                                        st.session_state.user_email,
+                                                        (comment or "") + " | Approved some items")
+                                        st.success("Approved selected items. Remaining kept pending.")
+                                    else:
+                                        update_submission_items(int(row['id']), [])
+                                        mark_submission(int(row['id']), "approved",
+                                                        st.session_state.user_email,
+                                                        (comment or "") + " | Approved all items")
+                                        st.success("Approved and completed.")
+                                    st.rerun()
+
+                        if reject_all:
+                            update_submission_items(int(row['id']), [])
+                            mark_submission(int(row['id']), "rejected",
+                                            st.session_state.user_email, comment or "")
+                            st.warning("Rejected all items.")
                             st.rerun()
 
     # Inventory
@@ -707,13 +772,14 @@ def show_admin_panel():
             with c3:
                 statusf = st.selectbox("Status", ["All"] + sorted(df['status'].dropna().unique().tolist()))
             with c4:
-                datef = st.date_input("Date", value=None)
+                apply_date = st.checkbox("Filter by date")
+                datef = st.date_input("Date", value=date.today()) if apply_date else None
 
             filtered = df.copy()
             if uf != "All": filtered = filtered[filtered['user_type'] == uf]
             if deptf != "All": filtered = filtered[filtered['department'] == deptf]
             if statusf != "All": filtered = filtered[filtered['status'] == statusf]
-            if datef:
+            if datef is not None:
                 filtered['submitted_at'] = pd.to_datetime(filtered['submitted_at'])
                 filtered = filtered[filtered['submitted_at'].dt.date == datef]
 
