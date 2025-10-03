@@ -438,7 +438,7 @@ def show_admin_panel():
             # Excel download
             
 
-        output = io.BytesIO()
+    output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             filtered_df.to_excel(writer, index=False)
         excel_data = output.getvalue()
