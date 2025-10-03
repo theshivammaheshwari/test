@@ -38,13 +38,35 @@ st.markdown("""
 def get_conn():
     return sqlite3.connect('lnmiit_forms.db', detect_types=sqlite3.PARSE_DECLTYPES)
 
-def add_column_if_missing(conn, table, column, coldef):
+def add_column_if_missing(conn, table, column, coldef, default_value=None):
     cur = conn.cursor()
+    # Check existing columns
     cur.execute(f"PRAGMA table_info({table})")
     cols = [r[1] for r in cur.fetchall()]
-    if column not in cols:
+    if column in cols:
+        return  # already present
+
+    # Try adding with given definition
+    try:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
         conn.commit()
+    except sqlite3.OperationalError as e:
+        # Fallback: add as TEXT only (some SQLite builds throw on DEFAULT in ALTER)
+        try:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+            conn.commit()
+        except sqlite3.OperationalError as e2:
+            # If still fails, just log and move on
+            print("Migration warning:", e, e2)
+            return
+
+    # Set default value for existing rows (if asked)
+    if default_value is not None:
+        try:
+            cur.execute(f"UPDATE {table} SET {column}=? WHERE {column} IS NULL", (default_value,))
+            conn.commit()
+        except Exception as e:
+            print("Set default failed:", e)
 
 def init_database():
     conn = get_conn()
@@ -84,8 +106,8 @@ def init_database():
             submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Add workflow columns
-    add_column_if_missing(conn, "form_submissions", "status", "TEXT DEFAULT 'pending'")
+        # Add workflow columns (safe migrations)
+    add_column_if_missing(conn, "form_submissions", "status", "TEXT DEFAULT 'pending'", default_value="pending")
     add_column_if_missing(conn, "form_submissions", "admin_comment", "TEXT")
     add_column_if_missing(conn, "form_submissions", "reviewed_at", "TIMESTAMP")
     add_column_if_missing(conn, "form_submissions", "approved_by", "TEXT")
@@ -162,10 +184,7 @@ def send_email(to_email, subject, body):
         return False
 
 def notify_admin_submission(form_data):
-    subject = f"New Item Issue Request: {form_data['name']} ({form_data['user_type']})"
-    items_text = "\n".join([f"- {it['name']} x {it['quantity']}" for it in form_data['items']])
-    body = f"""
-A new form has been submitted.
+    return  # no-op
 
 Name: {form_data['name']}
 Email: {form_data['email']}
@@ -187,10 +206,7 @@ Submitted at: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     send_email(SMTP_CONF["send_to"], subject, body)
 
 def notify_user_decision(user_email, decision, comment, items):
-    subject = f"Your Item Issue Request: {decision.capitalize()}"
-    items_text = "\n".join([f"- {it['name']} x {it['quantity']}" for it in items])
-    body = f"""
-Your request has been {decision}.
+    return  # no-op
 
 Items:
 {items_text}
@@ -600,7 +616,7 @@ def show_admin_panel():
             del st.session_state[k]
         st.rerun()
 
-    tabs = st.tabs(["Approvals", "Inventory", "All Submissions", "Email Test"])
+    tabs = st.tabs(["Approvals", "Inventory", "All Submissions"])
 
     # Approvals tab
     with tabs[0]:
