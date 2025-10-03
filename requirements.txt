@@ -1,0 +1,8 @@
+streamlit
+streamlit-authenticator
+pandas
+sqlite3
+openpyxl
+gspread
+google-auth
+email-validator
