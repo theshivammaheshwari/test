@@ -439,11 +439,11 @@ def show_admin_panel():
             
 
     output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
             filtered_df.to_excel(writer, index=False)
         excel_data = output.getvalue()
 
-        st.download_button(
+    st.download_button(
             label="📊 Download Excel",
             data=excel_data,
             file_name="lnmiit_forms.xlsx",
