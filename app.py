@@ -422,9 +422,9 @@ def show_admin_panel():
         
         st.dataframe(display_df, use_container_width=True)
         
-        # Download options
+                # Download options
         col1, col2 = st.columns(2)
-        
+
         with col1:
             csv = filtered_df.to_csv(index=False)
             st.download_button(
@@ -433,22 +433,17 @@ def show_admin_panel():
                 file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv"
             )
-        
+
         with col2:
-            # Excel download
-            
-
-        output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            filtered_df.to_excel(writer, index=False)
-            excel_data = output.getvalue()
-
-    st.download_button(
-            label="📊 Download Excel",
-            data=excel_data,
-            file_name="lnmiit_forms.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                filtered_df.to_excel(writer, index=False)
+            st.download_button(
+                label="📊 Download Excel",
+                data=output.getvalue(),
+                file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
 # Main application
 def main():
