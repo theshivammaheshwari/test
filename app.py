@@ -3,10 +3,8 @@ import sqlite3
 import pandas as pd
 import re
 from datetime import datetime, date
-import gspread
-from google.oauth2.service_account import Credentials
 import json
-
+import io
 # Page configuration
 st.set_page_config(
     page_title="LNMIIT Item Issue Form",
@@ -438,13 +436,19 @@ def show_admin_panel():
         
         with col2:
             # Excel download
-            excel_data = filtered_df.to_excel(index=False, engine='openpyxl')
-            st.download_button(
-                label="📊 Download Excel",
-                data=excel_data,
-                file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            filtered_df.to_excel(writer, index=False)
+        excel_data = output.getvalue()
+
+        st.download_button(
+            label="📊 Download Excel",
+            data=excel_data,
+            file_name="lnmiit_forms.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
 # Main application
 def main():
