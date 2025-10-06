@@ -93,6 +93,18 @@ def init_database():
     add_column_if_missing(conn, "form_submissions", "admin_comment", "TEXT")
     add_column_if_missing(conn, "form_submissions", "reviewed_at", "TIMESTAMP")
     add_column_if_missing(conn, "form_submissions", "approved_by", "TEXT")
+    # New columns to track requested/approved/remaining
+    add_column_if_missing(conn, "form_submissions", "items_requested", "TEXT")
+    add_column_if_missing(conn, "form_submissions", "items_remaining", "TEXT")
+    add_column_if_missing(conn, "form_submissions", "items_approved", "TEXT")
+    # Backfill old rows
+    try:
+        cur.execute("UPDATE form_submissions SET items_requested = COALESCE(items_requested, items)")
+        cur.execute("UPDATE form_submissions SET items_remaining = COALESCE(items_remaining, items)")
+        cur.execute("UPDATE form_submissions SET items_approved = COALESCE(items_approved, '[]')")
+        conn.commit()
+    except Exception as e:
+        print("Backfill warning:", e)
 
     conn.commit()
     ensure_admin_user(conn)
@@ -133,6 +145,34 @@ def notify_admin_submission(form_data):
 
 def notify_user_decision(user_email, decision, comment, items):
     return  # notifications disabled
+
+# --------------- Helpers for items JSON ---------------
+def load_items_json(s):
+    try:
+        if s is None or (isinstance(s, float) and pd.isna(s)) or s == "":
+            return []
+        return json.loads(s)
+    except Exception:
+        return []
+
+def items_to_text(items):
+    try:
+        return ", ".join([f"{i['name']} ({i['quantity']})" for i in items]) if items else ""
+    except Exception:
+        return ""
+
+def merge_items_add(base_list, add_list):
+    # returns merged list by name with summed quantities
+    agg = {}
+    for it in base_list + add_list:
+        if not it or 'name' not in it:
+            continue
+        name = str(it['name']).strip()
+        qty = int(it.get('quantity', 0) or 0)
+        agg[name] = agg.get(name, 0) + qty
+    merged = [{"name": k, "quantity": max(0, v)} for k, v in agg.items()]
+    merged.sort(key=lambda x: x["name"].lower())
+    return merged
 
 # --------------- DB Ops (Users/Auth) ---------------
 def validate_lnmiit_email(email):
@@ -304,11 +344,13 @@ def save_form_submission(form_data):
     items_json = json.dumps(form_data['items'])
     cur.execute('''
         INSERT INTO form_submissions 
-        (user_email, name, user_type, user_id, department, instructor_name, mobile, issue_date, return_date, items, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        (user_email, name, user_type, user_id, department, instructor_name, mobile, issue_date, return_date, 
+         items, items_requested, items_remaining, items_approved, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
     ''', (form_data['email'], form_data['name'], form_data['user_type'], form_data['user_id'],
           form_data['department'], form_data['instructor_name'], form_data['mobile'],
-          form_data['issue_date'], form_data['return_date'], items_json))
+          form_data['issue_date'], form_data['return_date'],
+          items_json, items_json, items_json, json.dumps([])))
     conn.commit(); conn.close()
 
 def get_all_submissions():
@@ -318,8 +360,19 @@ def get_all_submissions():
     return df
 
 def update_submission_items(sid: int, items_list: list):
+    # Update both old 'items' and new 'items_remaining'
     conn = get_conn(); cur = conn.cursor()
-    cur.execute("UPDATE form_submissions SET items=? WHERE id=?", (json.dumps(items_list), sid))
+    payload = json.dumps(items_list)
+    cur.execute("UPDATE form_submissions SET items=?, items_remaining=? WHERE id=?", (payload, payload, sid))
+    conn.commit(); conn.close()
+
+def add_approved_to_submission(sid: int, approved_items: list):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT items_approved FROM form_submissions WHERE id=?", (sid,))
+    row = cur.fetchone()
+    existing = load_items_json(row[0]) if row else []
+    merged = merge_items_add(existing, approved_items)
+    cur.execute("UPDATE form_submissions SET items_approved=? WHERE id=?", (json.dumps(merged), sid))
     conn.commit(); conn.close()
 
 def mark_submission(sid: int, status: str, admin_email: str, comment: str = ""):
@@ -462,107 +515,153 @@ def show_main_form():
             del st.session_state[k]
         st.rerun()
 
-    inv_df = inv_get_all()
-    available_items = inv_df['name'].tolist()
+    tabs = st.tabs(["New Request", "My Requests"])
 
-    departments = [
-        'Communication and Computer Engineering',
-        'Computer Science and Engineering',
-        'Electronics and Communication Engineering',
-        'Mechanical-Mechatronics Engineering',
-        'Physics', 'Mathematics', 'Humanities and Social Sciences', 'Others'
-    ]
+    # New Request tab
+    with tabs[0]:
+        inv_df = inv_get_all()
+        available_items = inv_df['name'].tolist()
 
-    default_return = date.today() + timedelta(days=1)
+        departments = [
+            'Communication and Computer Engineering',
+            'Computer Science and Engineering',
+            'Electronics and Communication Engineering',
+            'Mechanical-Mechatronics Engineering',
+            'Physics', 'Mathematics', 'Humanities and Social Sciences', 'Others'
+        ]
 
-    with st.form("item_issue_form"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            user_type = st.selectbox("User Type", ["student","faculty","staff"],
-                                     index=["student","faculty","staff"].index(st.session_state.get("user_type","student")))
-        with col2:
-            name = st.text_input("Name", value=st.session_state.user_name)
-        with col3:
-            user_id = st.text_input("Roll No" if user_type=="student" else "Employee No")
+        default_return = date.today() + timedelta(days=1)
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            department = st.selectbox("Department", [""] + departments)
-            if department == "Others":
-                other = st.text_input("Please specify department")
-                department = other if other else department
-        with col2:
-            mobile = st.text_input("Mobile No", placeholder="10-digit number")
-        with col3:
-            email = st.text_input("Email ID", value=st.session_state.user_email, disabled=True)
+        with st.form("item_issue_form"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                user_type = st.selectbox("User Type", ["student","faculty","staff"],
+                                        index=["student","faculty","staff"].index(st.session_state.get("user_type","student")))
+            with col2:
+                name = st.text_input("Name", value=st.session_state.user_name)
+            with col3:
+                user_id = st.text_input("Roll No" if user_type=="student" else "Employee No")
 
-        instructor_name = st.text_input("Instructor Name") if user_type=="student" else ""
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                department = st.selectbox("Department", [""] + departments)
+                if department == "Others":
+                    other = st.text_input("Please specify department")
+                    department = other if other else department
+            with col2:
+                mobile = st.text_input("Mobile No", placeholder="10-digit number")
+            with col3:
+                email = st.text_input("Email ID", value=st.session_state.user_email, disabled=True)
 
-        c1, c2 = st.columns(2)
-        with c1:
-            issue_date = st.date_input("Issue Date", value=date.today())
-        with c2:
-            return_date = st.date_input("Return Date", value=default_return)
+            instructor_name = st.text_input("Instructor Name") if user_type=="student" else ""
 
-        st.markdown("### 📦 Items to Issue")
-        if 'form_items' not in st.session_state:
-            st.session_state.form_items = [{'name': '', 'quantity': 1}]
+            c1, c2 = st.columns(2)
+            with c1:
+                issue_date = st.date_input("Issue Date", value=date.today())
+            with c2:
+                return_date = st.date_input("Return Date", value=default_return)
 
-        remove_index = None
-        for i, it in enumerate(st.session_state.form_items):
-            cc1, cc2, cc3 = st.columns([2, 1, 1])
-            with cc1:
-                item_name = st.selectbox(f"Item {i+1}", [""] + available_items, key=f"item_name_{i}")
-            with cc2:
-                qty = st.number_input(f"Quantity {i+1}", min_value=1, value=int(it.get('quantity',1) or 1), key=f"quantity_{i}")
-            with cc3:
-                if len(st.session_state.form_items) > 1:
-                    if st.form_submit_button(f"Remove {i+1}"):
-                        remove_index = i
-            st.session_state.form_items[i] = {'name': item_name, 'quantity': qty}
+            st.markdown("### 📦 Items to Issue")
+            if 'form_items' not in st.session_state:
+                st.session_state.form_items = [{'name': '', 'quantity': 1}]
 
-        if remove_index is not None:
-            st.session_state.form_items.pop(remove_index)
-            st.rerun()
+            remove_index = None
+            for i, it in enumerate(st.session_state.form_items):
+                cc1, cc2, cc3 = st.columns([2, 1, 1])
+                with cc1:
+                    item_name = st.selectbox(f"Item {i+1}", [""] + available_items, key=f"item_name_{i}")
+                with cc2:
+                    qty = st.number_input(f"Quantity {i+1}", min_value=1, value=int(it.get('quantity',1) or 1), key=f"quantity_{i}")
+                with cc3:
+                    if len(st.session_state.form_items) > 1:
+                        if st.form_submit_button(f"Remove {i+1}"):
+                            remove_index = i
+                st.session_state.form_items[i] = {'name': item_name, 'quantity': qty}
 
-        cadd, csub = st.columns([1,3])
-        with cadd:
-            add_clicked = st.form_submit_button("➕ Add Item")
-        with csub:
-            submitted = st.form_submit_button("Submit Form", type="primary")
+            if remove_index is not None:
+                st.session_state.form_items.pop(remove_index)
+                st.rerun()
 
-        if add_clicked:
-            st.session_state.form_items.append({'name':'','quantity':1})
-            st.rerun()
+            cadd, csub = st.columns([1,3])
+            with cadd:
+                add_clicked = st.form_submit_button("➕ Add Item")
+            with csub:
+                submitted = st.form_submit_button("Submit Form", type="primary")
 
-        if submitted:
-            errors = []
-            if not name: errors.append("Name is required")
-            if not user_id: errors.append("ID is required")
-            if not department: errors.append("Department is required")
-            if not mobile or not re.match(r'^\d{10}$', mobile): errors.append("Valid 10-digit mobile number is required")
-            if user_type=="student" and not instructor_name: errors.append("Instructor name is required for students")
-            if not return_date or return_date <= issue_date: errors.append("Return date must be after issue date")
-            valid_items = [x for x in st.session_state.form_items if x['name']]
-            if not valid_items: errors.append("At least one item is required")
+            if add_clicked:
+                st.session_state.form_items.append({'name':'','quantity':1})
+                st.rerun()
 
-            if errors:
-                for e in errors: st.error(e)
+            if submitted:
+                errors = []
+                if not name: errors.append("Name is required")
+                if not user_id: errors.append("ID is required")
+                if not department: errors.append("Department is required")
+                if not mobile or not re.match(r'^\d{10}$', mobile): errors.append("Valid 10-digit mobile number is required")
+                if user_type=="student" and not instructor_name: errors.append("Instructor name is required for students")
+                if not return_date or return_date <= issue_date: errors.append("Return date must be after issue date")
+                valid_items = [x for x in st.session_state.form_items if x['name']]
+                if not valid_items: errors.append("At least one item is required")
+
+                if errors:
+                    for e in errors: st.error(e)
+                else:
+                    form_data = {
+                        'email': email, 'name': name, 'user_type': user_type, 'user_id': user_id,
+                        'department': department, 'instructor_name': instructor_name, 'mobile': mobile,
+                        'issue_date': str(issue_date), 'return_date': str(return_date), 'items': valid_items
+                    }
+                    try:
+                        save_form_submission(form_data)
+                        st.success("✅ Form submitted! Your request is pending approval.")
+                        notify_admin_submission(form_data)  # no-op
+                        st.session_state.form_items = [{'name':'','quantity':1}]
+                        with st.expander("📋 Submitted Data"):
+                            st.json(form_data)
+                    except Exception as e:
+                        st.error(f"Error submitting form: {e}")
+
+    # My Requests tab (history)
+    with tabs[1]:
+        st.subheader("My Requests")
+        df_all = get_all_submissions()
+        if df_all.empty:
+            st.info("No submissions yet.")
+        else:
+            mydf = df_all[df_all['user_email'] == st.session_state.user_email].copy()
+            if mydf.empty:
+                st.info("You have no submissions yet.")
             else:
-                form_data = {
-                    'email': email, 'name': name, 'user_type': user_type, 'user_id': user_id,
-                    'department': department, 'instructor_name': instructor_name, 'mobile': mobile,
-                    'issue_date': str(issue_date), 'return_date': str(return_date), 'items': valid_items
-                }
-                try:
-                    save_form_submission(form_data)
-                    st.success("✅ Form submitted! Your request is pending approval.")
-                    notify_admin_submission(form_data)  # no-op
-                    st.session_state.form_items = [{'name':'','quantity':1}]
-                    with st.expander("📋 Submitted Data"):
-                        st.json(form_data)
-                except Exception as e:
-                    st.error(f"Error submitting form: {e}")
+                # Prepare display fields
+                req_list = []; app_list = []; rem_list = []
+                for _, r in mydf.iterrows():
+                    items_req = load_items_json(r.get('items_requested') if 'items_requested' in mydf.columns else r.get('items'))
+                    items_app = load_items_json(r.get('items_approved')) if 'items_approved' in mydf.columns else []
+                    items_rem = load_items_json(r.get('items_remaining') if 'items_remaining' in mydf.columns else r.get('items'))
+                    req_list.append(items_to_text(items_req))
+                    app_list.append(items_to_text(items_app))
+                    rem_list.append(items_to_text(items_rem))
+                mydf['Requested'] = req_list
+                mydf['Approved'] = app_list
+                mydf['Remaining'] = rem_list
+                cols = ['id','submitted_at','status','admin_comment','issue_date','return_date','Requested','Approved','Remaining']
+                cols = [c for c in cols if c in mydf.columns]
+                st.dataframe(mydf[cols].sort_values(by='submitted_at', ascending=False), use_container_width=True)
+
+                # Download
+                c1, c2 = st.columns(2)
+                with c1:
+                    csv = mydf.to_csv(index=False)
+                    st.download_button("📥 Download my submissions (CSV)", data=csv,
+                        file_name=f"my_requests_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv")
+                with c2:
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                        mydf.to_excel(writer, index=False)
+                    st.download_button("📊 Download my submissions (Excel)", data=output.getvalue(),
+                        file_name=f"my_requests_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # --------------- Admin Panel ---------------
 def show_admin_panel():
@@ -587,10 +686,12 @@ def show_admin_panel():
             if pending.empty:
                 st.success("No pending requests.")
             for _, row in pending.iterrows():
-                try:
-                    items_list = json.loads(row['items'])
-                except:
-                    items_list = []
+                # Load remaining items to approve from items_remaining (fallback to items)
+                if 'items_remaining' in pending.columns:
+                    items_json_raw = row['items_remaining']
+                else:
+                    items_json_raw = row['items']
+                items_list = load_items_json(items_json_raw)
 
                 with st.expander(f"#{row['id']} • {row['name']} • {row['user_type']} • {row['user_email']}"):
                     st.write(f"Department: {row['department']}")
@@ -657,7 +758,10 @@ def show_admin_panel():
                                         to_decrement.append({'name': items_list[idx]['name'], 'quantity': qty})
                                     decrement_inventory(to_decrement)
 
-                                    # Remaining items = requested - approved
+                                    # Add to approved list (cumulative)
+                                    add_approved_to_submission(int(row['id']), to_decrement)
+
+                                    # Remaining items = requested - approved_now
                                     remaining = []
                                     for idx, it in enumerate(items_list):
                                         approved_q = int(approved_quantities.get(idx, 0))
@@ -764,6 +868,7 @@ def show_admin_panel():
         if df.empty:
             st.info("No data.")
         else:
+            # Filters
             c1, c2, c3, c4 = st.columns(4)
             with c1:
                 uf = st.selectbox("User Type", ["All"] + sorted(df['user_type'].dropna().unique().tolist()))
@@ -783,26 +888,35 @@ def show_admin_panel():
                 filtered['submitted_at'] = pd.to_datetime(filtered['submitted_at'])
                 filtered = filtered[filtered['submitted_at'].dt.date == datef]
 
+            # Build display for requested/approved/remaining
+            req_col, app_col, rem_col = [], [], []
+            for _, r in filtered.iterrows():
+                items_req = load_items_json(r.get('items_requested') if 'items_requested' in filtered.columns else r.get('items'))
+                items_app = load_items_json(r.get('items_approved')) if 'items_approved' in filtered.columns else []
+                items_rem = load_items_json(r.get('items_remaining') if 'items_remaining' in filtered.columns else r.get('items'))
+                req_col.append(items_to_text(items_req))
+                app_col.append(items_to_text(items_app))
+                rem_col.append(items_to_text(items_rem))
             disp = filtered.copy()
-            def items_to_text(x):
-                try:
-                    arr = json.loads(x)
-                    return ", ".join([f"{i['name']} ({i['quantity']})" for i in arr])
-                except: return x
-            disp['items'] = disp['items'].apply(items_to_text)
+            disp['Requested'] = req_col
+            disp['Approved'] = app_col
+            disp['Remaining'] = rem_col
 
-            st.dataframe(disp, use_container_width=True)
+            show_cols = ['id','user_email','name','user_type','department','status','admin_comment','submitted_at','issue_date','return_date','Requested','Approved','Remaining']
+            show_cols = [c for c in show_cols if c in disp.columns]
+            st.dataframe(disp[show_cols], use_container_width=True)
 
+            # Downloads
             c1, c2 = st.columns(2)
             with c1:
-                csv = filtered.to_csv(index=False)
+                csv = disp.to_csv(index=False)
                 st.download_button("📥 Download CSV", data=csv,
                     file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv")
             with c2:
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                    filtered.to_excel(writer, index=False)
+                    disp.to_excel(writer, index=False)
                 st.download_button("📊 Download Excel", data=output.getvalue(),
                     file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
