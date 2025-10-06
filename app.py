@@ -13,7 +13,8 @@ st.set_page_config(page_title="LNMIIT Item Issue Form", page_icon="🎓", layout
 
 ADMIN_EMAIL = st.secrets.get("admin", {}).get("email", "smaheshwari@lnmiit.ac.in")
 ADMIN_INITIAL_PASSWORD = st.secrets.get("admin", {}).get("initial_password", "ChangeMe@123!")
-CSV_PATH = "items.csv"  # inventory CSV at repo root
+CSV_PATH = "items.csv"       # inventory CSV at repo root
+FACULTY_CSV_PATH = "faculty.csv"  # faculty list CSV at repo root
 
 # --------------- Styling ------------------
 st.markdown("""
@@ -21,6 +22,9 @@ st.markdown("""
     .main-header {
         background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
         padding: 1rem; border-radius: 10px; margin-bottom: 1rem; color: white;
+    }
+    .profile-box {
+        background: #f8fafc; border: 1px solid #e5e7eb; padding: 0.75rem 1rem; border-radius: 8px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -56,7 +60,7 @@ def init_database():
     conn = get_conn()
     cur = conn.cursor()
 
-    # Users
+    # Users table (base)
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,13 +70,18 @@ def init_database():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Auth + profile columns
     add_column_if_missing(conn, "users", "password_hash", "TEXT")
     add_column_if_missing(conn, "users", "salt", "TEXT")
     add_column_if_missing(conn, "users", "is_admin", "INTEGER DEFAULT 0")
     add_column_if_missing(conn, "users", "reset_code", "TEXT")
     add_column_if_missing(conn, "users", "reset_expires", "TIMESTAMP")
+    add_column_if_missing(conn, "users", "org_id", "TEXT")                # Roll/Emp No
+    add_column_if_missing(conn, "users", "department", "TEXT")
+    add_column_if_missing(conn, "users", "mobile", "TEXT")
+    add_column_if_missing(conn, "users", "profile_completed", "INTEGER DEFAULT 0")
 
-    # Forms
+    # Forms table
     cur.execute('''
         CREATE TABLE IF NOT EXISTS form_submissions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,15 +98,14 @@ def init_database():
             submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Workflow + tracking columns
     add_column_if_missing(conn, "form_submissions", "status", "TEXT DEFAULT 'pending'", default_value="pending")
     add_column_if_missing(conn, "form_submissions", "admin_comment", "TEXT")
     add_column_if_missing(conn, "form_submissions", "reviewed_at", "TIMESTAMP")
     add_column_if_missing(conn, "form_submissions", "approved_by", "TEXT")
-    # New columns to track requested/approved/remaining
     add_column_if_missing(conn, "form_submissions", "items_requested", "TEXT")
     add_column_if_missing(conn, "form_submissions", "items_remaining", "TEXT")
     add_column_if_missing(conn, "form_submissions", "items_approved", "TEXT")
-    # Backfill old rows
     try:
         cur.execute("UPDATE form_submissions SET items_requested = COALESCE(items_requested, items)")
         cur.execute("UPDATE form_submissions SET items_remaining = COALESCE(items_remaining, items)")
@@ -114,18 +122,23 @@ def ensure_admin_user(conn):
     cur = conn.cursor()
     cur.execute("SELECT id, password_hash, salt FROM users WHERE email = ?", (ADMIN_EMAIL,))
     row = cur.fetchone()
+    salt, pwd_hash = (None, None)
     if row is None or row[1] is None or row[2] is None:
         salt, pwd_hash = hash_password(ADMIN_INITIAL_PASSWORD)
         if row is None:
             cur.execute('''
-                INSERT INTO users (email, name, user_type, password_hash, salt, is_admin)
-                VALUES (?, ?, ?, ?, ?, 1)
+                INSERT INTO users (email, name, user_type, password_hash, salt, is_admin, profile_completed)
+                VALUES (?, ?, ?, ?, ?, 1, 1)
             ''', (ADMIN_EMAIL, "Admin", "admin", pwd_hash, salt))
         else:
             cur.execute('''
-                UPDATE users SET password_hash=?, salt=?, is_admin=1, user_type='admin', name='Admin'
+                UPDATE users SET password_hash=?, salt=?, is_admin=1, user_type='admin', name='Admin', profile_completed=1
                 WHERE email=?
             ''', (pwd_hash, salt, ADMIN_EMAIL))
+        conn.commit()
+    else:
+        # Ensure marked as admin and profile completed
+        cur.execute("UPDATE users SET is_admin=1, user_type='admin', name=COALESCE(name,'Admin'), profile_completed=1 WHERE email=?", (ADMIN_EMAIL,))
         conn.commit()
 
 # --------------- Password Security ---------------
@@ -162,7 +175,6 @@ def items_to_text(items):
         return ""
 
 def merge_items_add(base_list, add_list):
-    # returns merged list by name with summed quantities
     agg = {}
     for it in base_list + add_list:
         if not it or 'name' not in it:
@@ -174,7 +186,23 @@ def merge_items_add(base_list, add_list):
     merged.sort(key=lambda x: x["name"].lower())
     return merged
 
-# --------------- DB Ops (Users/Auth) ---------------
+# --------------- Faculty list ---------------
+def load_faculty_names():
+    if not os.path.exists(FACULTY_CSV_PATH):
+        return []
+    try:
+        df = pd.read_csv(FACULTY_CSV_PATH)
+        if df.empty:
+            return []
+        # Use "Name" column if exists, otherwise first column
+        col = "Name" if "Name" in df.columns else df.columns[0]
+        names = df[col].dropna().astype(str).str.strip()
+        names = sorted({n for n in names if n})
+        return names
+    except Exception:
+        return []
+
+# --------------- DB Ops (Users/Auth/Profile) ---------------
 def validate_lnmiit_email(email):
     return re.match(r'^[a-zA-Z0-9._%+-]+@lnmiit\.ac\.in$', email or "") is not None
 
@@ -191,6 +219,27 @@ def get_user(email):
         "password_hash": row[3], "salt": row[4], "is_admin": bool(row[5])
     }
 
+def get_user_profile(email):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT name, user_type, org_id, department, mobile, profile_completed FROM users WHERE email=?", (email,))
+    row = cur.fetchone(); conn.close()
+    if not row:
+        return {"name":"", "user_type":"student", "org_id":"", "department":"", "mobile":"", "profile_completed":0}
+    return {"name": row[0] or "", "user_type": row[1] or "student", "org_id": row[2] or "", "department": row[3] or "", "mobile": row[4] or "", "profile_completed": int(row[5] or 0)}
+
+def is_profile_completed(email):
+    p = get_user_profile(email)
+    return bool(p.get("profile_completed", 0))
+
+def update_user_profile(email, name, user_type, org_id, department, mobile, completed=True):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""
+        UPDATE users
+        SET name=?, user_type=?, org_id=?, department=?, mobile=?, profile_completed=?
+        WHERE email=?
+    """, (name, user_type, org_id, department, mobile, 1 if completed else 0, email))
+    conn.commit(); conn.close()
+
 def register_user(email, name, user_type, password):
     if not validate_lnmiit_email(email):
         raise ValueError("Only @lnmiit.ac.in email is allowed")
@@ -199,7 +248,7 @@ def register_user(email, name, user_type, password):
     salt, pwd_hash = hash_password(password)
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("INSERT INTO users (email, name, user_type, password_hash, salt, is_admin) VALUES (?, ?, ?, ?, ?, 0)",
+    cur.execute("INSERT INTO users (email, name, user_type, password_hash, salt, is_admin, profile_completed) VALUES (?, ?, ?, ?, ?, 0, 0)",
                 (email, name, user_type, pwd_hash, salt))
     conn.commit(); conn.close()
 
@@ -360,7 +409,6 @@ def get_all_submissions():
     return df
 
 def update_submission_items(sid: int, items_list: list):
-    # Update both old 'items' and new 'items_remaining'
     conn = get_conn(); cur = conn.cursor()
     payload = json.dumps(items_list)
     cur.execute("UPDATE form_submissions SET items=?, items_remaining=? WHERE id=?", (payload, payload, sid))
@@ -421,6 +469,9 @@ def auth_ui():
                     st.session_state.user_type = user["user_type"]
                     st.session_state.is_admin = user["is_admin"]
                     st.success("Login successful!")
+                    # If profile not complete, force setup
+                    if not is_profile_completed(user["email"]) and not user["is_admin"]:
+                        st.session_state.force_profile_setup = True
                     st.rerun()
                 else:
                     st.error("Invalid email or password")
@@ -454,8 +505,15 @@ def auth_ui():
                         st.error("Password must be at least 8 characters.")
                     else:
                         register_user(email, name, user_type, pwd)
-                        st.success("Account created! You can login now.")
-                        st.session_state.auth_mode = "login"; st.rerun()
+                        # Auto-login and force profile setup
+                        st.session_state.authenticated = True
+                        st.session_state.user_email = email
+                        st.session_state.user_name = name
+                        st.session_state.user_type = user_type
+                        st.session_state.is_admin = False
+                        st.session_state.force_profile_setup = True
+                        st.success("Account created! Please complete your profile.")
+                        st.rerun()
                 except sqlite3.IntegrityError:
                     st.error("This email is already registered.")
                 except Exception as e:
@@ -478,8 +536,7 @@ def auth_ui():
                     st.error("No account found with this email.")
                 else:
                     code = set_reset_code(email)
-                    # Email off: show code for testing (remove in production)
-                    st.info(f"Reset code (debug): {code}")
+                    st.info(f"Reset code (debug): {code}")  # email off
                     st.session_state.reset_email = email
                     st.session_state.auth_mode = "reset"
                     st.success("Reset code generated.")
@@ -505,6 +562,72 @@ def auth_ui():
                 else:
                     st.error(msg)
 
+# --------------- Profile UI ---------------
+def departments_list():
+    return [
+        'Communication and Computer Engineering',
+        'Computer Science and Engineering',
+        'Electronics and Communication Engineering',
+        'Mechanical-Mechatronics Engineering',
+        'Physics', 'Mathematics', 'Humanities and Social Sciences', 'Others'
+    ]
+
+def show_profile_form(initial_setup=False):
+    st.subheader("Profile")
+    email = st.session_state.user_email
+    prof = get_user_profile(email)
+
+    with st.form("profile_form"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            user_type = st.selectbox("User Type", ["student","faculty","staff"],
+                                     index=["student","faculty","staff"].index(prof.get("user_type","student")))
+        with col2:
+            name = st.text_input("Name", value=prof.get("name",""))
+        with col3:
+            org_id = st.text_input("Roll No" if user_type=="student" else "Employee No", value=prof.get("org_id",""))
+
+        col4, col5 = st.columns(2)
+        with col4:
+            dept = st.selectbox("Department", [""] + departments_list(), index=0 if not prof.get("department") else ([""]+departments_list()).index(prof.get("department","")) if prof.get("department") in departments_list() else 0)
+            if dept == "Others":
+                dept_other = st.text_input("Please specify department")
+                if dept_other.strip():
+                    dept = dept_other.strip()
+        with col5:
+            mobile = st.text_input("Mobile No", value=prof.get("mobile",""), placeholder="10-digit number")
+
+        st.text_input("Email", value=email, disabled=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            submit = st.form_submit_button("Save Profile", type="primary")
+        with c2:
+            cancel = st.form_submit_button("Cancel")
+
+        if submit:
+            # Basic validation
+            errors = []
+            if not name: errors.append("Name is required")
+            if not org_id: errors.append("Roll/Employee No is required")
+            if not dept: errors.append("Department is required")
+            if not mobile or not re.match(r'^\d{10}$', mobile): errors.append("Valid 10-digit mobile is required")
+
+            if errors:
+                for e in errors: st.error(e)
+            else:
+                update_user_profile(email, name, user_type, org_id, dept, mobile, completed=True)
+                # Update session hints
+                st.session_state.user_name = name
+                st.session_state.user_type = user_type
+                if "force_profile_setup" in st.session_state:
+                    del st.session_state["force_profile_setup"]
+                st.success("Profile saved!")
+                st.rerun()
+
+        if cancel and initial_setup:
+            st.warning("Profile setup required to continue.")
+
 # --------------- App UI (User) ---------------
 def show_main_form():
     st.markdown('<div class="main-header"><h3>LNMIIT Item Issue Form</h3></div>', unsafe_allow_html=True)
@@ -515,45 +638,52 @@ def show_main_form():
             del st.session_state[k]
         st.rerun()
 
-    tabs = st.tabs(["New Request", "My Requests"])
+    # If profile incomplete, force setup
+    if st.session_state.get("force_profile_setup") or not is_profile_completed(st.session_state.user_email):
+        st.info("Please complete your profile to continue.")
+        show_profile_form(initial_setup=True)
+        return
+
+    tabs = st.tabs(["New Request", "My Requests", "Profile"])
 
     # New Request tab
     with tabs[0]:
+        # Profile summary box
+        prof = get_user_profile(st.session_state.user_email)
+        st.markdown("##### Your Profile")
+        st.markdown(f"""
+<div class="profile-box">
+<b>User Type:</b> {prof['user_type'].title()}<br>
+<b>Name:</b> {prof['name']}<br>
+<b>{'Roll No' if prof['user_type']=='student' else 'Employee No'}:</b> {prof['org_id']}<br>
+<b>Department:</b> {prof['department']}<br>
+<b>Mobile:</b> {prof['mobile']}<br>
+<b>Email:</b> {st.session_state.user_email}
+</div>
+""", unsafe_allow_html=True)
+        st.caption("Need changes? Go to the Profile tab to update.")
+
         inv_df = inv_get_all()
         available_items = inv_df['name'].tolist()
-
-        departments = [
-            'Communication and Computer Engineering',
-            'Computer Science and Engineering',
-            'Electronics and Communication Engineering',
-            'Mechanical-Mechatronics Engineering',
-            'Physics', 'Mathematics', 'Humanities and Social Sciences', 'Others'
-        ]
 
         default_return = date.today() + timedelta(days=1)
 
         with st.form("item_issue_form"):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                user_type = st.selectbox("User Type", ["student","faculty","staff"],
-                                        index=["student","faculty","staff"].index(st.session_state.get("user_type","student")))
-            with col2:
-                name = st.text_input("Name", value=st.session_state.user_name)
-            with col3:
-                user_id = st.text_input("Roll No" if user_type=="student" else "Employee No")
+            # Instructor for students only
+            if prof["user_type"] == "student":
+                fac_names = load_faculty_names()
+                st.markdown("##### Instructor")
+                if fac_names:
+                    choice = st.selectbox("Instructor Name", [""] + fac_names + ["Other"])
+                    if choice == "Other":
+                        instructor_name = st.text_input("Enter Instructor Name")
+                    else:
+                        instructor_name = choice
+                else:
+                    instructor_name = st.text_input("Instructor Name")
 
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                department = st.selectbox("Department", [""] + departments)
-                if department == "Others":
-                    other = st.text_input("Please specify department")
-                    department = other if other else department
-            with col2:
-                mobile = st.text_input("Mobile No", placeholder="10-digit number")
-            with col3:
-                email = st.text_input("Email ID", value=st.session_state.user_email, disabled=True)
-
-            instructor_name = st.text_input("Instructor Name") if user_type=="student" else ""
+            else:
+                instructor_name = ""  # not applicable
 
             c1, c2 = st.columns(2)
             with c1:
@@ -586,7 +716,7 @@ def show_main_form():
             with cadd:
                 add_clicked = st.form_submit_button("➕ Add Item")
             with csub:
-                submitted = st.form_submit_button("Submit Form", type="primary")
+                submitted = st.form_submit_button("Submit Request", type="primary")
 
             if add_clicked:
                 st.session_state.form_items.append({'name':'','quantity':1})
@@ -594,27 +724,34 @@ def show_main_form():
 
             if submitted:
                 errors = []
-                if not name: errors.append("Name is required")
-                if not user_id: errors.append("ID is required")
-                if not department: errors.append("Department is required")
-                if not mobile or not re.match(r'^\d{10}$', mobile): errors.append("Valid 10-digit mobile number is required")
-                if user_type=="student" and not instructor_name: errors.append("Instructor name is required for students")
-                if not return_date or return_date <= issue_date: errors.append("Return date must be after issue date")
+                # Profile fields already validated at profile save; just re-check minimal here
+                if prof["user_type"] == "student" and not instructor_name:
+                    errors.append("Instructor name is required for students")
+                if not return_date or return_date <= issue_date:
+                    errors.append("Return date must be after issue date")
                 valid_items = [x for x in st.session_state.form_items if x['name']]
-                if not valid_items: errors.append("At least one item is required")
+                if not valid_items:
+                    errors.append("At least one item is required")
 
                 if errors:
                     for e in errors: st.error(e)
                 else:
                     form_data = {
-                        'email': email, 'name': name, 'user_type': user_type, 'user_id': user_id,
-                        'department': department, 'instructor_name': instructor_name, 'mobile': mobile,
-                        'issue_date': str(issue_date), 'return_date': str(return_date), 'items': valid_items
+                        'email': st.session_state.user_email,
+                        'name': prof['name'],
+                        'user_type': prof['user_type'],
+                        'user_id': prof['org_id'],
+                        'department': prof['department'],
+                        'instructor_name': instructor_name,
+                        'mobile': prof['mobile'],
+                        'issue_date': str(issue_date),
+                        'return_date': str(return_date),
+                        'items': valid_items
                     }
                     try:
                         save_form_submission(form_data)
-                        st.success("✅ Form submitted! Your request is pending approval.")
-                        notify_admin_submission(form_data)  # no-op
+                        st.success("✅ Request submitted! Your request is pending approval.")
+                        notify_admin_submission(form_data)  # no-op for now
                         st.session_state.form_items = [{'name':'','quantity':1}]
                         with st.expander("📋 Submitted Data"):
                             st.json(form_data)
@@ -632,8 +769,7 @@ def show_main_form():
             if mydf.empty:
                 st.info("You have no submissions yet.")
             else:
-                # Prepare display fields
-                req_list = []; app_list = []; rem_list = []
+                req_list, app_list, rem_list = [], [], []
                 for _, r in mydf.iterrows():
                     items_req = load_items_json(r.get('items_requested') if 'items_requested' in mydf.columns else r.get('items'))
                     items_app = load_items_json(r.get('items_approved')) if 'items_approved' in mydf.columns else []
@@ -648,7 +784,7 @@ def show_main_form():
                 cols = [c for c in cols if c in mydf.columns]
                 st.dataframe(mydf[cols].sort_values(by='submitted_at', ascending=False), use_container_width=True)
 
-                # Download
+                # Downloads
                 c1, c2 = st.columns(2)
                 with c1:
                     csv = mydf.to_csv(index=False)
@@ -662,6 +798,10 @@ def show_main_form():
                     st.download_button("📊 Download my submissions (Excel)", data=output.getvalue(),
                         file_name=f"my_requests_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # Profile tab
+    with tabs[2]:
+        show_profile_form(initial_setup=False)
 
 # --------------- Admin Panel ---------------
 def show_admin_panel():
@@ -686,12 +826,8 @@ def show_admin_panel():
             if pending.empty:
                 st.success("No pending requests.")
             for _, row in pending.iterrows():
-                # Load remaining items to approve from items_remaining (fallback to items)
-                if 'items_remaining' in pending.columns:
-                    items_json_raw = row['items_remaining']
-                else:
-                    items_json_raw = row['items']
-                items_list = load_items_json(items_json_raw)
+                # Use items_remaining primarily
+                items_list = load_items_json(row.get('items_remaining') if 'items_remaining' in pending.columns else row.get('items'))
 
                 with st.expander(f"#{row['id']} • {row['name']} • {row['user_type']} • {row['user_email']}"):
                     st.write(f"Department: {row['department']}")
@@ -929,6 +1065,12 @@ def main():
         auth_ui()
         if not st.session_state.get("authenticated", False):
             return
+
+    # If non-admin and profile incomplete, show profile setup page first
+    if not st.session_state.get("is_admin", False) and (st.session_state.get("force_profile_setup") or not is_profile_completed(st.session_state.user_email)):
+        st.markdown('<div class="main-header"><h3>Complete Your Profile</h3></div>', unsafe_allow_html=True)
+        show_profile_form(initial_setup=True)
+        return
 
     if st.session_state.get("is_admin", False) and st.session_state.get("user_email","").lower() == ADMIN_EMAIL.lower():
         show_admin_panel()
