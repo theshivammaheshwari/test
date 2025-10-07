@@ -1131,3 +1131,92 @@ def show_admin_panel():
                     inv_adjust(sel, int(delta))
                     st.success("Updated.")
                     st.rerun()
+
+    # All submissions
+    with tabs[3]:
+        st.subheader("All Submissions")
+        df = get_all_submissions()
+        if df.empty:
+            st.info("No data.")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                uf = st.selectbox("User Type", ["All"] + sorted(df['user_type'].dropna().unique().tolist()))
+            with c2:
+                deptf = st.selectbox("Department", ["All"] + sorted(df['department'].dropna().unique().tolist()))
+            with c3:
+                statusf = st.selectbox("Status", ["All"] + sorted(df['status'].dropna().unique().tolist()))
+            with c4:
+                apply_date = st.checkbox("Filter by date")
+                datef = st.date_input("Date", value=date.today()) if apply_date else None
+
+            filtered = df.copy()
+            if uf != "All": filtered = filtered[filtered['user_type'] == uf]
+            if deptf != "All": filtered = filtered[filtered['department'] == deptf]
+            if statusf != "All": filtered = filtered[filtered['status'] == statusf]
+            if datef is not None:
+                filtered['submitted_at'] = pd.to_datetime(filtered['submitted_at'])
+                filtered = filtered[filtered['submitted_at'].dt.date == datef]
+
+            req_col, app_col, ret_col, out_col, due_col = [], [], [], [], []
+            for _, r in filtered.iterrows():
+                items_req = load_items_json(r.get('items_requested') if 'items_requested' in filtered.columns else r.get('items'))
+                items_app = load_items_json(r.get('items_approved')) if 'items_approved' in filtered.columns else []
+                items_ret = load_items_json(r.get('items_returned')) if 'items_returned' in filtered.columns else []
+                items_out = subtract_items(items_app, items_ret)
+                req_col.append(items_to_text(items_req))
+                app_col.append(items_to_text(items_app))
+                ret_col.append(items_to_text(items_ret))
+                out_col.append(items_to_text(items_out))
+                # due flag
+                try:
+                    rt = pd.to_datetime(r.get('return_date')).date()
+                    due_col.append("Yes" if (date.today() > rt and sum_qty(items_out) > 0) else "No")
+                except:
+                    due_col.append("No")
+            disp = filtered.copy()
+            disp['Requested'] = req_col
+            disp['Approved'] = app_col
+            disp['Returned'] = ret_col
+            disp['Outstanding'] = out_col
+            disp['Overdue'] = due_col
+
+            show_cols = ['id','user_email','name','user_type','department','status','Overdue','admin_comment','submitted_at','issue_date','return_date','Requested','Approved','Returned','Outstanding']
+            show_cols = [c for c in show_cols if c in disp.columns]
+            st.dataframe(disp[show_cols], use_container_width=True)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                csv = disp.to_csv(index=False)
+                st.download_button("📥 Download CSV", data=csv,
+                    file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv")
+            with c2:
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                    disp.to_excel(writer, index=False)
+                st.download_button("📊 Download Excel", data=output.getvalue(),
+                    file_name=f"lnmiit_forms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# --------------- Main ---------------
+def main():
+    init_database()
+
+    if not st.session_state.get("authenticated", False):
+        auth_ui()
+        if not st.session_state.get("authenticated", False):
+            return
+
+    if not st.session_state.get("is_admin", False) and (st.session_state.get("force_profile_setup") or not is_profile_completed(st.session_state.user_email)):
+        st.markdown('<div class="main-header"><h3>Complete Your Profile</h3></div>', unsafe_allow_html=True)
+        show_profile_form(initial_setup=True)
+        return
+
+    if st.session_state.get("is_admin", False) and st.session_state.get("user_email","").lower() == ADMIN_EMAIL.lower():
+        show_admin_panel()
+    else:
+        show_main_form()
+
+if __name__ == "__main__":
+    main()
